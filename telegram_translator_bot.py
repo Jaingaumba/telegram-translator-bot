@@ -3,7 +3,6 @@ import asyncio
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from googletrans import Translator
 import re
 import threading
 from flask import Flask
@@ -15,8 +14,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize translator
-translator = Translator()
+# Initialize translator - using requests instead of googletrans to avoid conflicts
+import requests
+import json
+from urllib.parse import quote
+
+# User settings storage
 user_settings = {}
 
 # Flask app for Render (keeps bot awake)
@@ -34,27 +37,54 @@ def run_flask():
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
 
-# Detect language
+# Alternative translation using Google Translate API (more reliable)
 def detect_language(text):
     try:
-        detected = translator.detect(text)
-        return detected.lang
+        # Simple language detection based on character sets
+        ukrainian_chars = set('абвгґдеєжзиіїйклмнопрстуфхцчшщьюя')
+        english_chars = set('abcdefghijklmnopqrstuvwxyz')
+        
+        text_lower = text.lower()
+        uk_count = sum(1 for char in text_lower if char in ukrainian_chars)
+        en_count = sum(1 for char in text_lower if char in english_chars)
+        
+        if uk_count > en_count:
+            return 'uk'
+        elif en_count > uk_count:
+            return 'en'
+        else:
+            return 'unknown'
     except:
         return 'unknown'
 
-# Translate text
 async def translate_text(text, target_lang):
     try:
-        # Clean text (remove extra whitespace)
+        # Clean text
         cleaned_text = re.sub(r'\s+', ' ', text.strip())
         if not cleaned_text or len(cleaned_text) < 3:
             return text
-            
-        result = translator.translate(cleaned_text, dest=target_lang)
-        return result.text
+        
+        # Use Google Translate via web API (more reliable)
+        base_url = "https://translate.googleapis.com/translate_a/single"
+        params = {
+            'client': 'gtx',
+            'sl': 'auto',
+            'tl': target_lang,
+            'dt': 't',
+            'q': cleaned_text
+        }
+        
+        response = requests.get(base_url, params=params, timeout=10)
+        if response.status_code == 200:
+            result = response.json()
+            if result and result[0] and result[0][0]:
+                return result[0][0][0]
+        
+        return text  # Return original if translation fails
+        
     except Exception as e:
         logger.error(f"Translation error: {e}")
-        return text  # Return original text if translation fails
+        return text
 
 # Get user settings
 def get_user_settings(user_id):
@@ -409,21 +439,21 @@ def main():
     flask_thread.start()
     
     # Create application
-    app = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).build()
     
     # Add handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("settings", settings))
-    app.add_handler(CommandHandler("toggle", toggle))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("settings", settings))
+    application.add_handler(CommandHandler("toggle", toggle))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # Start the bot
     logger.info("🚀 Bot starting on Render...")
     logger.info("Bot is running 24/7 with auto-wake functionality!")
     
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()

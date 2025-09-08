@@ -1,10 +1,11 @@
 import os
 import logging
+import threading
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler, CallbackContext
 import requests
 import re
-from flask import Flask, request
+from flask import Flask
 
 # Configure logging
 logging.basicConfig(
@@ -19,14 +20,17 @@ user_settings = {}
 # Initialize Flask app
 app = Flask(__name__)
 
-# Get bot token from environment variable
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-if not BOT_TOKEN:
-    logger.error("❌ ERROR: BOT_TOKEN environment variable not set!")
-    raise ValueError("BOT_TOKEN not set in environment variables")
+@app.route('/')
+def home():
+    return "🌍 Telegram Translation Bot is running! ✅"
 
-# Build the application
-application = Application.builder().token(BOT_TOKEN).build()
+@app.route('/health')
+def health():
+    return "OK", 200
+
+def run_flask():
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # Language detection function
 def detect_language(text):
@@ -99,8 +103,9 @@ def update_user_settings(user_id, new_settings):
     user_settings[user_id].update(new_settings)
 
 # Bot command handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def start(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
+    
     if str(user_id) not in user_settings:
         user_settings[str(user_id)] = get_user_settings(user_id)
     
@@ -120,23 +125,23 @@ Welcome! I automatically translate between English and Ukrainian.
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     try:
-        await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
+        update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Error in start command: {e}")
-        await update.message.reply_text("Bot started successfully!")
+        update.message.reply_text("Bot started successfully!")
 
-async def toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def toggle(update: Update, context: CallbackContext):
     try:
         user_id = update.effective_user.id
         settings = get_user_settings(user_id)
         new_status = not settings['auto_translate']
         update_user_settings(user_id, {'auto_translate': new_status})
         status_text = "enabled ✅" if new_status else "disabled ❌"
-        await update.message.reply_text(f"Auto-translation {status_text}")
+        update.message.reply_text(f"Auto-translation {status_text}")
     except Exception as e:
         logger.error(f"Error in toggle command: {e}")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def help_command(update: Update, context: CallbackContext):
     help_text = """❓ **Help & Instructions**
 
 **Setup:**
@@ -145,27 +150,27 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 3. Start chatting normally!"""
 
     try:
-        await update.message.reply_text(help_text, parse_mode='Markdown')
+        update.message.reply_text(help_text, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Error in help command: {e}")
-        await update.message.reply_text("Use /start to begin, /toggle to turn translation on/off")
+        update.message.reply_text("Use /start to begin, /toggle to turn translation on/off")
 
 # Button callback handlers
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def button_callback(update: Update, context: CallbackContext):
     query = update.callback_query
-    await query.answer()
+    query.answer()
     
     try:
         if query.data == "help":
-            await help_callback(query, context)
+            help_callback(query, context)
         elif query.data == "toggle":
-            await toggle_callback(query, context)
+            toggle_callback(query, context)
         elif query.data == "back":
-            await back_callback(query, context)
+            back_callback(query, context)
     except Exception as e:
         logger.error(f"Error in button callback: {e}")
 
-async def help_callback(query, context):
+def help_callback(query, context):
     help_text = """❓ **Quick Help**
 
 **How to use:**
@@ -177,9 +182,9 @@ async def help_callback(query, context):
 
     keyboard = [[InlineKeyboardButton("🔙 Back to Main", callback_data="back")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(help_text, reply_markup=reply_markup, parse_mode='Markdown')
+    query.edit_message_text(help_text, reply_markup=reply_markup, parse_mode='Markdown')
 
-async def toggle_callback(query, context):
+def toggle_callback(query, context):
     try:
         user_id = query.from_user.id
         settings = get_user_settings(user_id)
@@ -189,11 +194,11 @@ async def toggle_callback(query, context):
         message_text = f"Auto-translation {status_text}"
         keyboard = [[InlineKeyboardButton("🔙 Back to Main", callback_data="back")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(message_text, reply_markup=reply_markup)
+        query.edit_message_text(message_text, reply_markup=reply_markup)
     except Exception as e:
         logger.error(f"Error in toggle callback: {e}")
 
-async def back_callback(query, context):
+def back_callback(query, context):
     welcome_text = """🌍 **Telegram Auto-Translator Bot**
 
 Welcome! I automatically translate between English and Ukrainian.
@@ -205,10 +210,10 @@ Ready to start translating! 🚀"""
         [InlineKeyboardButton("⚙️ Toggle Translation", callback_data="toggle")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
+    query.edit_message_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
 
 # Main message handler for translation
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def handle_message(update: Update, context: CallbackContext):
     try:
         if not update.message or not update.message.text:
             return
@@ -238,7 +243,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not target_lang:
             return
             
-        # Use synchronous translation function
         translated_text = translate_text(text, target_lang)
         
         if translated_text and translated_text.lower().strip() != text.lower().strip():
@@ -248,7 +252,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             translation_message = f"🌍 **{from_lang} → {to_lang}**\n{translated_text}"
             
-            await context.bot.send_message(
+            context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=translation_message,
                 parse_mode='Markdown',
@@ -258,75 +262,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error handling message: {e}")
 
-# Add all handlers to the application
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("toggle", toggle))
-application.add_handler(CommandHandler("help", help_command))
-application.add_handler(CallbackQueryHandler(button_callback))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+def main():
+    """Main function to start the bot"""
+    BOT_TOKEN = os.environ.get('BOT_TOKEN')
+    
+    if not BOT_TOKEN:
+        logger.error("❌ ERROR: BOT_TOKEN environment variable not set!")
+        logger.error("Please set your bot token in Render dashboard > Environment")
+        return
+    
+    logger.info("🚀 Starting Telegram Translation Bot...")
+    
+    # Create bot updater with proper context
+    updater = Updater(BOT_TOKEN, use_context=True)
+    
+    # Get the dispatcher to register handlers
+    dp = updater.dispatcher
+    
+    # Add command handlers
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("toggle", toggle))
+    dp.add_handler(CommandHandler("help", help_command))
+    
+    # Add button callback handler
+    dp.add_handler(CallbackQueryHandler(button_callback))
+    
+    # Add message handler for translation
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+    
+    # Start the Bot
+    updater.start_polling()
+    
+    # Run the bot until you press Ctrl-C
+    logger.info("✅ Bot handlers configured")
+    logger.info("🌍 Translation Bot is now running 24/7!")
+    logger.info("💬 Ready to translate Ukrainian ↔ English")
+    
+    updater.idle()
 
-# Initialize the application
-application.initialize()
-
-# Flask Routes for Render
-@app.route('/')
-def home():
-    return "🌍 Telegram Translation Bot is running! ✅"
-
-@app.route('/health')
-def health():
-    return "OK", 200
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Route that receives updates from Telegram"""
-    try:
-        json_data = request.get_json()
-        update = Update.de_json(json_data, application.bot)
-        
-        # Process the update
-        application.process_update(update)
-        
-        return 'OK', 200
-    except Exception as e:
-        logger.error(f"Error in webhook route: {e}")
-        return 'Error', 500
-
-def set_webhook():
-    """Set the webhook URL for this bot"""
-    try:
-        PUBLIC_URL = os.environ.get('RENDER_EXTERNAL_URL')
-        if not PUBLIC_URL:
-            logger.error("❌ RENDER_EXTERNAL_URL environment variable not set!")
-            return False
-
-        webhook_url = f"{PUBLIC_URL}/webhook"
-        token = os.environ.get('BOT_TOKEN')
-        set_webhook_url = f"https://api.telegram.org/bot{token}/setWebhook?url={webhook_url}"
-
-        response = requests.get(set_webhook_url, timeout=10)
-        result = response.json()
-
-        if result.get('ok'):
-            logger.info(f"✅ Webhook set successfully: {webhook_url}")
-            return True
-        else:
-            logger.error(f"❌ Failed to set webhook: {result}")
-            return False
-    except Exception as e:
-        logger.error(f"❌ Exception setting webhook: {e}")
-        return False
-
-# Main entry point
 if __name__ == '__main__':
-    logger.info("🚀 Starting Telegram Translation Bot on Render...")
-
-    # Set the webhook
-    webhook_set = set_webhook()
-    if not webhook_set:
-        logger.error("Failed to set webhook. Check your BOT_TOKEN and RENDER_EXTERNAL_URL.")
-
-    # Start the Flask server
-    port = int(os.environ.get('PORT', 10000))
-    logger.info(f"🌐 Starting Flask server on port {port}")
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    # Start Flask server in background thread (required for Render)
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("✅ Flask server started for Render")
+    
+    # Start the bot
+    main()

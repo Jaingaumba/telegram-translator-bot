@@ -1,12 +1,13 @@
 import os
 import logging
 import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from flask import Flask, request, jsonify
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 import requests
 import re
-from flask import Flask
 import threading
+import json
+from typing import Dict, Any
 
 # Configure logging
 logging.basicConfig(
@@ -16,13 +17,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # User settings storage
-user_settings = {}
+user_settings: Dict[str, Dict[str, Any]] = {}
 
 # Initialize Flask app
 app = Flask(__name__)
 
-# Language detection function
-def detect_language(text):
+# Global bot instance
+bot_instance = None
+
+def detect_language(text: str) -> str:
     """Simple but effective language detection for Ukrainian and English"""
     try:
         ukrainian_chars = set('абвгґдеєжзиіїйклмнопрстуфхцчшщьюяАБВГҐДЕЄЖЗИІЇЙКЛМНОПРСТУФХЦЧШЩЬЮЯ')
@@ -41,31 +44,30 @@ def detect_language(text):
         logger.error(f"Language detection error: {e}")
         return 'unknown'
 
-# FIXED: Enhanced translation function that handles long text properly
-def translate_text(text, target_lang):
-    """Translate text using Google Translate free web API - FIXED for long text"""
+def translate_text_enhanced(text: str, target_lang: str) -> str:
+    """Enhanced translation function that handles complete long text"""
     try:
         cleaned_text = re.sub(r'\s+', ' ', text.strip())
         if not cleaned_text or len(cleaned_text) < 3:
             return text
             
-        # Split long text into chunks to avoid truncation
-        max_length = 4000  # Google Translate limit
+        # Handle long text by splitting into manageable chunks
+        max_length = 4000
         if len(cleaned_text) <= max_length:
             chunks = [cleaned_text]
         else:
-            # Split by sentences to maintain context
-            sentences = re.split(r'[.!?]+', cleaned_text)
+            # Smart chunking by sentences
+            sentences = re.split(r'(?<=[.!?])\s+', cleaned_text)
             chunks = []
             current_chunk = ""
             
             for sentence in sentences:
-                if len(current_chunk + sentence) <= max_length:
-                    current_chunk += sentence + ". "
+                if len(current_chunk + " " + sentence) <= max_length:
+                    current_chunk += " " + sentence if current_chunk else sentence
                 else:
                     if current_chunk:
                         chunks.append(current_chunk.strip())
-                    current_chunk = sentence + ". "
+                    current_chunk = sentence
             
             if current_chunk:
                 chunks.append(current_chunk.strip())
@@ -77,7 +79,6 @@ def translate_text(text, target_lang):
                 continue
                 
             url = "https://translate.googleapis.com/translate_a/single"
-            
             params = {
                 'client': 'gtx',
                 'sl': 'auto',
@@ -87,53 +88,104 @@ def translate_text(text, target_lang):
             }
             
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             }
             
-            response = requests.get(url, params=params, headers=headers, timeout=15)
-            
-            if response.status_code == 200:
-                result = response.json()
-                # FIXED: Proper extraction of complete translated text
-                if result and len(result) > 0 and result[0]:
-                    chunk_translation = ""
-                    for segment in result[0]:
-                        if segment and segment[0]:
-                            chunk_translation += segment[0]
+            try:
+                response = requests.get(url, params=params, headers=headers, timeout=10)
+                
+                if response.status_code == 200:
+                    result = response.json()
                     
-                    if chunk_translation:
-                        translated_chunks.append(chunk_translation)
+                    # Properly extract all translation segments
+                    if result and result[0]:
+                        translated_segments = []
+                        for segment in result[0]:
+                            if segment and len(segment) > 0 and segment[0]:
+                                translated_segments.append(segment[0])
+                        
+                        if translated_segments:
+                            chunk_translation = ''.join(translated_segments)
+                            translated_chunks.append(chunk_translation)
+                        else:
+                            translated_chunks.append(chunk)
                     else:
                         translated_chunks.append(chunk)
                 else:
                     translated_chunks.append(chunk)
-            else:
+                    
+            except Exception as e:
+                logger.error(f"Translation request error: {e}")
                 translated_chunks.append(chunk)
         
         # Join all translated chunks
-        final_translation = " ".join(translated_chunks).strip()
+        final_translation = ' '.join(translated_chunks).strip()
         return final_translation if final_translation else text
         
     except Exception as e:
         logger.error(f"Translation error: {e}")
         return text
 
-# User settings functions
-def get_user_settings(user_id):
+def get_user_settings(user_id: int) -> Dict[str, Any]:
     return user_settings.get(str(user_id), {
         'auto_translate': True,
         'translate_own_messages': True
     })
 
-def update_user_settings(user_id, new_settings):
-    user_id = str(user_id)
-    if user_id not in user_settings:
-        user_settings[user_id] = get_user_settings(user_id)
-    user_settings[user_id].update(new_settings)
+def update_user_settings(user_id: int, new_settings: Dict[str, Any]) -> None:
+    user_id_str = str(user_id)
+    if user_id_str not in user_settings:
+        user_settings[user_id_str] = get_user_settings(user_id)
+    user_settings[user_id_str].update(new_settings)
 
-# Bot command handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def send_long_message(bot: Bot, chat_id: int, text: str, reply_to_message_id: int = None, parse_mode: str = None):
+    """Send long messages by splitting them if necessary"""
+    max_length = 4000
+    
+    if len(text) <= max_length:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_to_message_id=reply_to_message_id,
+            parse_mode=parse_mode
+        )
+    else:
+        # Split long messages
+        parts = []
+        remaining = text
+        
+        while remaining:
+            if len(remaining) <= max_length:
+                parts.append(remaining)
+                break
+            
+            # Find good break point
+            break_point = remaining.rfind('. ', 0, max_length - 100)
+            if break_point == -1:
+                break_point = remaining.rfind(' ', 0, max_length - 100)
+            if break_point == -1:
+                break_point = max_length - 100
+            
+            parts.append(remaining[:break_point + 1])
+            remaining = remaining[break_point + 1:].strip()
+        
+        # Send all parts
+        for i, part in enumerate(parts):
+            await bot.send_message(
+                chat_id=chat_id,
+                text=part + (" ..." if i < len(parts) - 1 else ""),
+                reply_to_message_id=reply_to_message_id if i == 0 else None,
+                parse_mode=parse_mode
+            )
+            
+            if i < len(parts) - 1:
+                await asyncio.sleep(0.5)
+
+# Message handlers
+async def handle_start(bot: Bot, update_data: dict):
+    user_id = update_data['message']['from']['id']
+    chat_id = update_data['message']['chat']['id']
+    
     if str(user_id) not in user_settings:
         user_settings[str(user_id)] = get_user_settings(user_id)
     
@@ -144,7 +196,7 @@ Welcome! I automatically translate between English and Ukrainian.
 **Features:**
 • Ukrainian → English (for you)
 • English → Ukrainian (for your colleagues)
-• Works with long messages and complete paragraphs
+• Complete message translation (handles long text)
 • Smart language detection
 • Works in groups and private chats
 
@@ -153,32 +205,39 @@ Welcome! I automatically translate between English and Ukrainian.
 /toggle - Turn auto-translation on/off
 /help - Get detailed help
 
-Ready to start translating! 🚀"""
+Ready to start translating!"""
 
-    keyboard = [
-        [InlineKeyboardButton("❓ Help", callback_data="help")],
-        [InlineKeyboardButton("⚙️ Toggle Translation", callback_data="toggle")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "❓ Help", "callback_data": "help"}],
+            [{"text": "⚙️ Toggle Translation", "callback_data": "toggle"}]
+        ]
+    }
     
-    try:
-        await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"Error in start command: {e}")
-        await update.message.reply_text("Bot started successfully!")
+    await bot.send_message(
+        chat_id=chat_id,
+        text=welcome_text,
+        parse_mode='Markdown',
+        reply_markup=keyboard
+    )
 
-async def toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        user_id = update.effective_user.id
-        settings = get_user_settings(user_id)
-        new_status = not settings['auto_translate']
-        update_user_settings(user_id, {'auto_translate': new_status})
-        status_text = "enabled ✅" if new_status else "disabled ❌"
-        await update.message.reply_text(f"Auto-translation {status_text}")
-    except Exception as e:
-        logger.error(f"Error in toggle command: {e}")
+async def handle_toggle(bot: Bot, update_data: dict):
+    user_id = update_data['message']['from']['id']
+    chat_id = update_data['message']['chat']['id']
+    
+    settings = get_user_settings(user_id)
+    new_status = not settings['auto_translate']
+    update_user_settings(user_id, {'auto_translate': new_status})
+    
+    status_text = "enabled ✅" if new_status else "disabled ❌"
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"Auto-translation {status_text}"
+    )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_help(bot: Bot, update_data: dict):
+    chat_id = update_data['message']['chat']['id']
+    
     help_text = """❓ **Help & Instructions**
 
 **Setup:**
@@ -187,11 +246,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 3. Start chatting normally!
 
 **Translation Features:**
-• Handles long messages and complete paragraphs
-• Maintains formatting and context
+• Translates complete messages (not just first sentences)
+• Handles long paragraphs and multiple sentences
 • Ukrainian ↔ English translation
 • Smart language detection
-• Works in real-time
+• Real-time translation
 
 **Commands:**
 • /start - Welcome message and setup
@@ -199,36 +258,28 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • /help - Show this help
 
 **Tips:**
-• Bot translates complete messages, not just first sentences
-• Works best with proper punctuation
-• Supports messages up to Telegram's character limit
+• Bot translates entire messages, maintaining context
+• Works with very long messages
 • Translation appears as replies to original messages
+• Use /toggle to turn translation on/off anytime
 
-Ready to communicate seamlessly! 🌍"""
+Ready to communicate seamlessly!"""
 
-    try:
-        await update.message.reply_text(help_text, parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"Error in help command: {e}")
-        await update.message.reply_text("Use /start to begin, /toggle to turn translation on/off")
+    await bot.send_message(
+        chat_id=chat_id,
+        text=help_text,
+        parse_mode='Markdown'
+    )
 
-# Button callback handlers
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def handle_callback_query(bot: Bot, update_data: dict):
+    callback_query = update_data['callback_query']
+    data = callback_query['data']
+    chat_id = callback_query['message']['chat']['id']
+    message_id = callback_query['message']['message_id']
+    user_id = callback_query['from']['id']
     
-    try:
-        if query.data == "help":
-            await help_callback(query, context)
-        elif query.data == "toggle":
-            await toggle_callback(query, context)
-        elif query.data == "back":
-            await back_callback(query, context)
-    except Exception as e:
-        logger.error(f"Error in button callback: {e}")
-
-async def help_callback(query, context):
-    help_text = """❓ **Quick Help**
+    if data == "help":
+        help_text = """❓ **Quick Help**
 
 **How to use:**
 1. Add me to your group chat
@@ -239,198 +290,242 @@ async def help_callback(query, context):
 
 **Features:**
 • Translates full messages, not just first lines
-• Maintains paragraph structure
-• Works with long content
+• Handles long content and paragraphs
+• Maintains message structure
 
 The bot works automatically - no setup needed!"""
 
-    keyboard = [[InlineKeyboardButton("🔙 Back to Main", callback_data="back")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(help_text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def toggle_callback(query, context):
-    try:
-        user_id = query.from_user.id
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "🔙 Back to Main", "callback_data": "back"}]
+            ]
+        }
+        
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=help_text,
+            parse_mode='Markdown',
+            reply_markup=keyboard
+        )
+    
+    elif data == "toggle":
         settings = get_user_settings(user_id)
         new_status = not settings['auto_translate']
         update_user_settings(user_id, {'auto_translate': new_status})
+        
         status_text = "enabled ✅" if new_status else "disabled ❌"
         message_text = f"Auto-translation {status_text}"
-        keyboard = [[InlineKeyboardButton("🔙 Back to Main", callback_data="back")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(message_text, reply_markup=reply_markup)
-    except Exception as e:
-        logger.error(f"Error in toggle callback: {e}")
-
-async def back_callback(query, context):
-    welcome_text = """🌍 **Telegram Auto-Translator Bot**
+        
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "🔙 Back to Main", "callback_data": "back"}]
+            ]
+        }
+        
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=message_text,
+            reply_markup=keyboard
+        )
+    
+    elif data == "back":
+        welcome_text = """🌍 **Telegram Auto-Translator Bot**
 
 Welcome! I automatically translate between English and Ukrainian.
 
-Ready to start translating! 🚀"""
-    
-    keyboard = [
-        [InlineKeyboardButton("❓ Help", callback_data="help")],
-        [InlineKeyboardButton("⚙️ Toggle Translation", callback_data="toggle")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
+Ready to start translating!"""
+        
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "❓ Help", "callback_data": "help"}],
+                [{"text": "⚙️ Toggle Translation", "callback_data": "toggle"}]
+            ]
+        }
+        
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=welcome_text,
+            parse_mode='Markdown',
+            reply_markup=keyboard
+        )
 
-# FIXED: Enhanced message handler that processes complete messages
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(bot: Bot, update_data: dict):
+    """Handle regular messages for translation"""
+    message = update_data['message']
+    
+    if 'text' not in message:
+        return
+    
+    text = message['text']
+    user_id = message['from']['id']
+    chat_id = message['chat']['id']
+    message_id = message['message_id']
+    
+    # Skip commands
+    if text.startswith('/'):
+        return
+    
+    # Skip very short messages
+    if len(text.strip()) < 3:
+        return
+    
+    # Check user settings
+    settings = get_user_settings(user_id)
+    if not settings['auto_translate']:
+        return
+    
+    # Detect language and determine target
+    detected_lang = detect_language(text)
+    target_lang = None
+    
+    if detected_lang == 'uk':
+        target_lang = 'en'
+    elif detected_lang == 'en':
+        target_lang = 'uk'
+    else:
+        target_lang = 'en'  # Default to English
+    
+    if not target_lang:
+        return
+    
+    # Translate the message
+    translated_text = translate_text_enhanced(text, target_lang)
+    
+    # Only send if translation is different
+    if translated_text and translated_text.lower().strip() != text.lower().strip():
+        lang_names = {'en': 'English', 'uk': 'Ukrainian', 'unknown': 'Auto'}
+        from_lang = lang_names.get(detected_lang, detected_lang.upper())
+        to_lang = lang_names.get(target_lang, target_lang.upper())
+        
+        translation_message = f"🌍 **{from_lang} → {to_lang}**\n{translated_text}"
+        
+        await send_long_message(
+            bot=bot,
+            chat_id=chat_id,
+            text=translation_message,
+            reply_to_message_id=message_id,
+            parse_mode='Markdown'
+        )
+
+async def process_update(update_data: dict):
+    """Process incoming Telegram updates"""
+    global bot_instance
+    
     try:
-        if not update.message or not update.message.text:
-            return
-        
-        text = update.message.text
-        user_id = update.effective_user.id
-        
-        if text.startswith('/'):
-            return
-        
-        if len(text.strip()) < 3:
-            return
-        
-        settings = get_user_settings(user_id)
-        if not settings['auto_translate']:
-            return
-        
-        detected_lang = detect_language(text)
-        target_lang = None
-        
-        if detected_lang == 'uk':
-            target_lang = 'en'
-        elif detected_lang == 'en':
-            target_lang = 'uk'
-        else:
-            target_lang = 'en'  # Default to English for unknown languages
-        
-        if not target_lang:
-            return
+        if 'message' in update_data:
+            message = update_data['message']
             
-        # FIXED: Use the enhanced translation function
-        translated_text = translate_text(text, target_lang)
+            if 'text' in message:
+                text = message['text']
+                
+                if text == '/start':
+                    await handle_start(bot_instance, update_data)
+                elif text == '/toggle':
+                    await handle_toggle(bot_instance, update_data)
+                elif text == '/help':
+                    await handle_help(bot_instance, update_data)
+                else:
+                    await handle_message(bot_instance, update_data)
         
-        if translated_text and translated_text.lower().strip() != text.lower().strip():
-            lang_names = {'en': 'English', 'uk': 'Ukrainian', 'unknown': 'Auto'}
-            from_lang = lang_names.get(detected_lang, detected_lang.upper())
-            to_lang = lang_names.get(target_lang, target_lang.upper())
+        elif 'callback_query' in update_data:
+            await handle_callback_query(bot_instance, update_data)
             
-            # Split long translations if needed for Telegram's message limit
-            max_telegram_length = 4000
-            if len(translated_text) <= max_telegram_length:
-                translation_message = f"🌍 **{from_lang} → {to_lang}**\n{translated_text}"
-                
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=translation_message,
-                    parse_mode='Markdown',
-                    reply_to_message_id=update.message.message_id
-                )
-            else:
-                # Send long translations in multiple parts
-                header = f"🌍 **{from_lang} → {to_lang}**\n"
-                parts = []
-                remaining_text = translated_text
-                
-                while remaining_text:
-                    if len(remaining_text) <= (max_telegram_length - len(header)):
-                        parts.append(header + remaining_text)
-                        break
-                    else:
-                        # Find a good break point (sentence end)
-                        break_point = max_telegram_length - len(header) - 50
-                        break_pos = remaining_text.rfind('. ', 0, break_point)
-                        if break_pos == -1:
-                            break_pos = remaining_text.rfind(' ', 0, break_point)
-                        if break_pos == -1:
-                            break_pos = break_point
-                        
-                        parts.append(header + remaining_text[:break_pos + 1])
-                        remaining_text = remaining_text[break_pos + 1:].strip()
-                        header = "🌍 **(continued)**\n"  # For subsequent parts
-                
-                # Send all parts
-                for i, part in enumerate(parts):
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=part,
-                        parse_mode='Markdown',
-                        reply_to_message_id=update.message.message_id if i == 0 else None
-                    )
-                    
-                    # Small delay between parts to avoid rate limiting
-                    if i < len(parts) - 1:
-                        await asyncio.sleep(0.5)
-    
     except Exception as e:
-        logger.error(f"Error handling message: {e}")
+        logger.error(f"Error processing update: {e}")
 
-# Flask Routes for Render
+# Flask Routes
 @app.route('/')
 def home():
     return "🌍 Telegram Translation Bot is running! ✅"
 
 @app.route('/health')
 def health():
-    return "OK", 200
+    return jsonify({"status": "OK"}), 200
 
-def run_flask():
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Handle incoming webhook from Telegram"""
+    try:
+        update_data = request.json
+        
+        # Process update asynchronously
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(process_update(update_data))
+        loop.close()
+        
+        return jsonify({"status": "OK"}), 200
+        
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return jsonify({"error": str(e)}), 500
 
-# FIXED: Proper async bot initialization and polling
-async def run_bot():
-    """Run the bot with proper async handling"""
-    BOT_TOKEN = os.environ.get('BOT_TOKEN')
+def set_webhook():
+    """Set up webhook with Telegram"""
+    try:
+        token = os.environ.get('BOT_TOKEN')
+        webhook_url = os.environ.get('WEBHOOK_URL')
+        
+        if not token:
+            logger.error("BOT_TOKEN not found in environment variables")
+            return False
+            
+        if not webhook_url:
+            logger.error("WEBHOOK_URL not found in environment variables")
+            return False
+        
+        url = f"https://api.telegram.org/bot{token}/setWebhook"
+        data = {
+            'url': f"{webhook_url}/webhook",
+            'allowed_updates': ['message', 'callback_query']
+        }
+        
+        response = requests.post(url, json=data, timeout=10)
+        result = response.json()
+        
+        if result.get('ok'):
+            logger.info(f"✅ Webhook set successfully: {webhook_url}/webhook")
+            return True
+        else:
+            logger.error(f"❌ Failed to set webhook: {result}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Exception setting webhook: {e}")
+        return False
+
+def main():
+    """Initialize bot and start Flask server"""
+    global bot_instance
     
-    if not BOT_TOKEN:
-        logger.error("❌ ERROR: BOT_TOKEN environment variable not set!")
+    # Get environment variables
+    token = os.environ.get('BOT_TOKEN')
+    
+    if not token:
+        logger.error("❌ BOT_TOKEN environment variable not set!")
         return
+    
+    # Initialize bot instance
+    bot_instance = Bot(token=token)
     
     logger.info("🚀 Starting Telegram Translation Bot...")
     
-    # Create bot application
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Set webhook
+    if set_webhook():
+        logger.info("✅ Bot configured successfully")
+        logger.info("🌍 Translation Bot is ready!")
+        logger.info("💬 Supports complete message translation (Ukrainian ↔ English)")
+    else:
+        logger.error("❌ Failed to configure webhook")
+        return
     
-    # Add command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("toggle", toggle))
-    application.add_handler(CommandHandler("help", help_command))
-    
-    # Add button callback handler
-    application.add_handler(CallbackQueryHandler(button_callback))
-    
-    # Add message handler for translation
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-    )
-    
-    logger.info("✅ Bot handlers configured")
-    logger.info("🌍 Translation Bot is now running 24/7!")
-    logger.info("💬 Ready to translate Ukrainian ↔ English (complete messages)")
-    
-    # Run the bot with polling (more reliable than webhooks on Render)
-    await application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-        close_loop=False
-    )
-
-def main():
-    """Main function"""
-    # Start Flask server in background thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info("✅ Flask server started for Render health checks")
-    
-    # Run the bot
-    try:
-        asyncio.run(run_bot())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.error(f"Bot error: {e}")
+    # Start Flask server
+    port = int(os.environ.get('PORT', 10000))
+    logger.info(f"🌐 Starting server on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=False)
 
 if __name__ == '__main__':
     main()

@@ -5,6 +5,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import requests
 import re
 from flask import Flask, request
+import asyncio
 
 # Configure logging
 logging.basicConfig(
@@ -40,7 +41,7 @@ def detect_language(text):
         return 'unknown'
 
 # Translation function using Google Translate web API
-async def translate_text(text, target_lang):
+def translate_text(text, target_lang):
     """Translate text using Google Translate free web API"""
     try:
         cleaned_text = re.sub(r'\s+', ' ', text.strip())
@@ -229,7 +230,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not target_lang:
             return
             
-        translated_text = await translate_text(text, target_lang)
+        # Use synchronous translation function
+        translated_text = translate_text(text, target_lang)
         
         if translated_text and translated_text.lower().strip() != text.lower().strip():
             lang_names = {'en': 'English', 'uk': 'Ukrainian', 'unknown': 'Auto'}
@@ -258,12 +260,18 @@ def health():
     return "OK", 200
 
 @app.route('/webhook', methods=['POST'])
-async def webhook():
+def webhook():
     """Route that receives updates from Telegram"""
     try:
         json_data = request.get_json()
         update = Update.de_json(json_data, application.bot)
-        await application.process_update(update)
+        
+        # Run the async processing in an event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(application.process_update(update))
+        loop.close()
+        
         return 'OK', 200
     except Exception as e:
         logger.error(f"Error in webhook route: {e}")
@@ -294,9 +302,14 @@ def set_webhook():
         logger.error(f"❌ Exception setting webhook: {e}")
         return False
 
+# Global application instance
+application = None
+
 # Main function to run the bot
-async def main():
+def main():
     """Main function to start the bot"""
+    global application
+    
     # Get bot token from environment variable
     BOT_TOKEN = os.environ.get('BOT_TOKEN')
     
@@ -332,22 +345,13 @@ async def main():
     logger.info("✅ Bot handlers configured")
     logger.info("🌍 Translation Bot is now running 24/7!")
     logger.info("💬 Ready to translate Ukrainian ↔ English")
+
+# Run the application
+if __name__ == '__main__':
+    # Initialize the bot
+    main()
     
     # Start the Flask server
     port = int(os.environ.get('PORT', 10000))
     logger.info(f"🌐 Starting Flask server on port {port}")
-    
-    # For production, we need to run Flask in a separate way
-    # This will keep the application running
-    try:
-        # Import here to avoid circular imports
-        from waitress import serve
-        serve(app, host="0.0.0.0", port=port)
-    except ImportError:
-        logger.warning("Waitress not available, using Flask development server")
-        app.run(host="0.0.0.0", port=port, debug=False)
-
-# Run the application
-if __name__ == '__main__':
-    import asyncio
-    asyncio.run(main())
+    app.run(host="0.0.0.0", port=port, debug=False)

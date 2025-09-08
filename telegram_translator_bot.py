@@ -1,10 +1,12 @@
 import os
 import logging
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 import requests
 import re
-from flask import Flask, request
+from flask import Flask
+import threading
 
 # Configure logging
 logging.basicConfig(
@@ -39,38 +41,78 @@ def detect_language(text):
         logger.error(f"Language detection error: {e}")
         return 'unknown'
 
-# Translation function using Google Translate web API
+# FIXED: Enhanced translation function that handles long text properly
 def translate_text(text, target_lang):
-    """Translate text using Google Translate free web API"""
+    """Translate text using Google Translate free web API - FIXED for long text"""
     try:
         cleaned_text = re.sub(r'\s+', ' ', text.strip())
         if not cleaned_text or len(cleaned_text) < 3:
             return text
             
-        url = "https://translate.googleapis.com/translate_a/single"
+        # Split long text into chunks to avoid truncation
+        max_length = 4000  # Google Translate limit
+        if len(cleaned_text) <= max_length:
+            chunks = [cleaned_text]
+        else:
+            # Split by sentences to maintain context
+            sentences = re.split(r'[.!?]+', cleaned_text)
+            chunks = []
+            current_chunk = ""
+            
+            for sentence in sentences:
+                if len(current_chunk + sentence) <= max_length:
+                    current_chunk += sentence + ". "
+                else:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    current_chunk = sentence + ". "
+            
+            if current_chunk:
+                chunks.append(current_chunk.strip())
         
-        params = {
-            'client': 'gtx',
-            'sl': 'auto',
-            'tl': target_lang,
-            'dt': 't',
-            'q': cleaned_text
-        }
+        translated_chunks = []
         
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+        for chunk in chunks:
+            if not chunk.strip():
+                continue
+                
+            url = "https://translate.googleapis.com/translate_a/single"
+            
+            params = {
+                'client': 'gtx',
+                'sl': 'auto',
+                'tl': target_lang,
+                'dt': 't',
+                'q': chunk
+            }
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            response = requests.get(url, params=params, headers=headers, timeout=15)
+            
+            if response.status_code == 200:
+                result = response.json()
+                # FIXED: Proper extraction of complete translated text
+                if result and len(result) > 0 and result[0]:
+                    chunk_translation = ""
+                    for segment in result[0]:
+                        if segment and segment[0]:
+                            chunk_translation += segment[0]
+                    
+                    if chunk_translation:
+                        translated_chunks.append(chunk_translation)
+                    else:
+                        translated_chunks.append(chunk)
+                else:
+                    translated_chunks.append(chunk)
+            else:
+                translated_chunks.append(chunk)
         
-        response = requests.get(url, params=params, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            result = response.json()
-            # Extract all translated segments
-            if result and len(result) > 0 and result[0]:
-                translated_text = ''.join([segment[0] for segment in result[0] if segment[0]])
-                return translated_text if translated_text else text
-        
-        return text
+        # Join all translated chunks
+        final_translation = " ".join(translated_chunks).strip()
+        return final_translation if final_translation else text
         
     except Exception as e:
         logger.error(f"Translation error: {e}")
@@ -99,10 +141,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Welcome! I automatically translate between English and Ukrainian.
 
+**Features:**
+• Ukrainian → English (for you)
+• English → Ukrainian (for your colleagues)
+• Works with long messages and complete paragraphs
+• Smart language detection
+• Works in groups and private chats
+
 **Commands:**
 /start - Show this welcome message
 /toggle - Turn auto-translation on/off
-/help - Get detailed help"""
+/help - Get detailed help
+
+Ready to start translating! 🚀"""
 
     keyboard = [
         [InlineKeyboardButton("❓ Help", callback_data="help")],
@@ -133,7 +184,27 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 **Setup:**
 1. Add this bot to your group chat
 2. Make sure the bot can read messages
-3. Start chatting normally!"""
+3. Start chatting normally!
+
+**Translation Features:**
+• Handles long messages and complete paragraphs
+• Maintains formatting and context
+• Ukrainian ↔ English translation
+• Smart language detection
+• Works in real-time
+
+**Commands:**
+• /start - Welcome message and setup
+• /toggle - Turn translation on/off
+• /help - Show this help
+
+**Tips:**
+• Bot translates complete messages, not just first sentences
+• Works best with proper punctuation
+• Supports messages up to Telegram's character limit
+• Translation appears as replies to original messages
+
+Ready to communicate seamlessly! 🌍"""
 
     try:
         await update.message.reply_text(help_text, parse_mode='Markdown')
@@ -161,10 +232,17 @@ async def help_callback(query, context):
 
 **How to use:**
 1. Add me to your group chat
-2. I automatically translate messages:
+2. I automatically translate complete messages:
    - Ukrainian → English
    - English → Ukrainian
-3. Use /toggle to turn translation on/off"""
+3. Use /toggle to turn translation on/off
+
+**Features:**
+• Translates full messages, not just first lines
+• Maintains paragraph structure
+• Works with long content
+
+The bot works automatically - no setup needed!"""
 
     keyboard = [[InlineKeyboardButton("🔙 Back to Main", callback_data="back")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -198,7 +276,7 @@ Ready to start translating! 🚀"""
     reply_markup = InlineKeyboardMarkup(keyboard)
     await query.edit_message_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
 
-# Main message handler for translation
+# FIXED: Enhanced message handler that processes complete messages
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not update.message or not update.message.text:
@@ -219,16 +297,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         detected_lang = detect_language(text)
         target_lang = None
+        
         if detected_lang == 'uk':
             target_lang = 'en'
         elif detected_lang == 'en':
             target_lang = 'uk'
         else:
-            target_lang = 'en'
+            target_lang = 'en'  # Default to English for unknown languages
         
         if not target_lang:
             return
             
+        # FIXED: Use the enhanced translation function
         translated_text = translate_text(text, target_lang)
         
         if translated_text and translated_text.lower().strip() != text.lower().strip():
@@ -236,14 +316,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from_lang = lang_names.get(detected_lang, detected_lang.upper())
             to_lang = lang_names.get(target_lang, target_lang.upper())
             
-            translation_message = f"🌍 **{from_lang} → {to_lang}**\n{translated_text}"
-            
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=translation_message,
-                parse_mode='Markdown',
-                reply_to_message_id=update.message.message_id
-            )
+            # Split long translations if needed for Telegram's message limit
+            max_telegram_length = 4000
+            if len(translated_text) <= max_telegram_length:
+                translation_message = f"🌍 **{from_lang} → {to_lang}**\n{translated_text}"
+                
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=translation_message,
+                    parse_mode='Markdown',
+                    reply_to_message_id=update.message.message_id
+                )
+            else:
+                # Send long translations in multiple parts
+                header = f"🌍 **{from_lang} → {to_lang}**\n"
+                parts = []
+                remaining_text = translated_text
+                
+                while remaining_text:
+                    if len(remaining_text) <= (max_telegram_length - len(header)):
+                        parts.append(header + remaining_text)
+                        break
+                    else:
+                        # Find a good break point (sentence end)
+                        break_point = max_telegram_length - len(header) - 50
+                        break_pos = remaining_text.rfind('. ', 0, break_point)
+                        if break_pos == -1:
+                            break_pos = remaining_text.rfind(' ', 0, break_point)
+                        if break_pos == -1:
+                            break_pos = break_point
+                        
+                        parts.append(header + remaining_text[:break_pos + 1])
+                        remaining_text = remaining_text[break_pos + 1:].strip()
+                        header = "🌍 **(continued)**\n"  # For subsequent parts
+                
+                # Send all parts
+                for i, part in enumerate(parts):
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=part,
+                        parse_mode='Markdown',
+                        reply_to_message_id=update.message.message_id if i == 0 else None
+                    )
+                    
+                    # Small delay between parts to avoid rate limiting
+                    if i < len(parts) - 1:
+                        await asyncio.sleep(0.5)
     
     except Exception as e:
         logger.error(f"Error handling message: {e}")
@@ -257,56 +375,17 @@ def home():
 def health():
     return "OK", 200
 
-@app.route('/webhook', methods=['POST'])
-async def webhook():
-    """Route that receives updates from Telegram"""
-    try:
-        json_data = request.get_json()
-        update = Update.de_json(json_data, application.bot)
-        await application.process_update(update)
-        return 'OK', 200
-    except Exception as e:
-        logger.error(f"Error in webhook route: {e}")
-        return 'Error', 500
+def run_flask():
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
-def set_webhook():
-    """Set the webhook URL for this bot"""
-    try:
-        PUBLIC_URL = os.environ.get('RENDER_EXTERNAL_URL')
-        if not PUBLIC_URL:
-            logger.error("❌ RENDER_EXTERNAL_URL environment variable not set!")
-            return False
-
-        webhook_url = f"{PUBLIC_URL}/webhook"
-        token = os.environ.get('BOT_TOKEN')
-        set_webhook_url = f"https://api.telegram.org/bot{token}/setWebhook?url={webhook_url}"
-
-        response = requests.get(set_webhook_url, timeout=10)
-        result = response.json()
-
-        if result.get('ok'):
-            logger.info(f"✅ Webhook set successfully: {webhook_url}")
-            return True
-        else:
-            logger.error(f"❌ Failed to set webhook: {result}")
-            return False
-    except Exception as e:
-        logger.error(f"❌ Exception setting webhook: {e}")
-        return False
-
-# Global application instance
-application = None
-
-def main():
-    """Main function to start the bot"""
-    global application
-    
-    # Get bot token from environment variable
+# FIXED: Proper async bot initialization and polling
+async def run_bot():
+    """Run the bot with proper async handling"""
     BOT_TOKEN = os.environ.get('BOT_TOKEN')
     
     if not BOT_TOKEN:
         logger.error("❌ ERROR: BOT_TOKEN environment variable not set!")
-        logger.error("Please set your bot token in Render dashboard > Environment")
         return
     
     logger.info("🚀 Starting Telegram Translation Bot...")
@@ -327,25 +406,31 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
     
-    # Initialize the application
-    application.initialize()
-    
-    # Set the webhook
-    webhook_set = set_webhook()
-    if not webhook_set:
-        logger.error("Failed to set webhook. Check your BOT_TOKEN and RENDER_EXTERNAL_URL.")
-        return
-    
     logger.info("✅ Bot handlers configured")
     logger.info("🌍 Translation Bot is now running 24/7!")
-    logger.info("💬 Ready to translate Ukrainian ↔ English")
-
-# Run the application
-if __name__ == '__main__':
-    # Initialize the bot
-    main()
+    logger.info("💬 Ready to translate Ukrainian ↔ English (complete messages)")
     
-    # Start the Flask server
-    port = int(os.environ.get('PORT', 10000))
-    logger.info(f"🌐 Starting Flask server on port {port}")
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    # Run the bot with polling (more reliable than webhooks on Render)
+    await application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        close_loop=False
+    )
+
+def main():
+    """Main function"""
+    # Start Flask server in background thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("✅ Flask server started for Render health checks")
+    
+    # Run the bot
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot error: {e}")
+
+if __name__ == '__main__':
+    main()

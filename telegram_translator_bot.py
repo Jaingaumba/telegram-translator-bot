@@ -6,7 +6,6 @@ import requests
 import re
 from flask import Flask, request
 from waitress import serve
-import json
 
 # Configure logging
 logging.basicConfig(
@@ -50,7 +49,7 @@ def detect_language(text):
         logger.error(f"Language detection error: {e}")
         return 'unknown'
 
-# Translation function using Google Translate web API
+# Translation function using Google Translate web API - FIXED for full text
 async def translate_text(text, target_lang):
     """Translate text using Google Translate free web API"""
     try:
@@ -76,9 +75,11 @@ async def translate_text(text, target_lang):
         
         if response.status_code == 200:
             result = response.json()
-            if result and len(result) > 0 and result[0] and len(result[0]) > 0:
-                translated = result[0][0][0]
-                return translated if translated else text
+            # FIX: Extract all translated segments, not just the first one
+            if result and len(result) > 0 and result[0]:
+                # Combine all translated segments
+                translated_text = ''.join([segment[0] for segment in result[0] if segment[0]])
+                return translated_text if translated_text else text
         
         return text
         

@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 import requests
@@ -27,11 +28,11 @@ def home():
 
 @app.route('/health')
 def health():
-    return "OK"
+    return "OK", 200
 
 def run_flask():
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # Language detection function
 def detect_language(text):
@@ -80,10 +81,10 @@ async def translate_text(text, target_lang):
         
         # Headers to mimic a browser request
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
         
-        # Make the API call
+        # Make the API call with timeout
         response = requests.get(url, params=params, headers=headers, timeout=10)
         
         if response.status_code == 200:
@@ -155,24 +156,31 @@ Ready to start translating! 🚀"""
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(
-        welcome_text, 
-        reply_markup=reply_markup, 
-        parse_mode='Markdown'
-    )
+    try:
+        await update.message.reply_text(
+            welcome_text, 
+            reply_markup=reply_markup, 
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Error in start command: {e}")
+        await update.message.reply_text("Bot started successfully!")
 
 async def toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /toggle command"""
-    user_id = update.effective_user.id
-    settings = get_user_settings(user_id)
-    
-    # Toggle the setting
-    new_status = not settings['auto_translate']
-    update_user_settings(user_id, {'auto_translate': new_status})
-    
-    # Send confirmation
-    status_text = "enabled ✅" if new_status else "disabled ❌"
-    await update.message.reply_text(f"Auto-translation {status_text}")
+    try:
+        user_id = update.effective_user.id
+        settings = get_user_settings(user_id)
+        
+        # Toggle the setting
+        new_status = not settings['auto_translate']
+        update_user_settings(user_id, {'auto_translate': new_status})
+        
+        # Send confirmation
+        status_text = "enabled ✅" if new_status else "disabled ❌"
+        await update.message.reply_text(f"Auto-translation {status_text}")
+    except Exception as e:
+        logger.error(f"Error in toggle command: {e}")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command"""
@@ -209,7 +217,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Need more help? The bot is designed to work automatically!"""
     
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    try:
+        await update.message.reply_text(help_text, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error in help command: {e}")
+        await update.message.reply_text("Bot help: Use /start to begin, /toggle to turn translation on/off")
 
 # Button callback handlers
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -217,10 +229,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    if query.data == "help":
-        await help_callback(query, context)
-    elif query.data == "toggle":
-        await toggle_callback(query, context)
+    try:
+        if query.data == "help":
+            await help_callback(query, context)
+        elif query.data == "toggle":
+            await toggle_callback(query, context)
+        elif query.data == "back":
+            await back_callback(query, context)
+    except Exception as e:
+        logger.error(f"Error in button callback: {e}")
 
 async def help_callback(query, context):
     """Handle help button press"""
@@ -243,58 +260,87 @@ The bot works automatically - no setup needed!"""
     keyboard = [[InlineKeyboardButton("🔙 Back to Main", callback_data="back")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await query.edit_message_text(
-        help_text, 
-        reply_markup=reply_markup, 
-        parse_mode='Markdown'
-    )
+    try:
+        await query.edit_message_text(
+            help_text, 
+            reply_markup=reply_markup, 
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Error in help callback: {e}")
 
 async def toggle_callback(query, context):
     """Handle toggle button press"""
-    user_id = query.from_user.id
-    settings = get_user_settings(user_id)
+    try:
+        user_id = query.from_user.id
+        settings = get_user_settings(user_id)
+        
+        # Toggle the setting
+        new_status = not settings['auto_translate']
+        update_user_settings(user_id, {'auto_translate': new_status})
+        
+        # Update message
+        status_text = "enabled ✅" if new_status else "disabled ❌"
+        message_text = f"Auto-translation {status_text}"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Back to Main", callback_data="back")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            message_text,
+            reply_markup=reply_markup
+        )
+    except Exception as e:
+        logger.error(f"Error in toggle callback: {e}")
+
+async def back_callback(query, context):
+    """Handle back button press"""
+    welcome_text = """🌍 **Telegram Auto-Translator Bot**
+
+Welcome! I automatically translate between English and Ukrainian.
+
+Ready to start translating! 🚀"""
     
-    # Toggle the setting
-    new_status = not settings['auto_translate']
-    update_user_settings(user_id, {'auto_translate': new_status})
-    
-    # Update message
-    status_text = "enabled ✅" if new_status else "disabled ❌"
-    message_text = f"Auto-translation {status_text}"
-    
-    keyboard = [[InlineKeyboardButton("🔙 Back to Main", callback_data="back")]]
+    keyboard = [
+        [InlineKeyboardButton("❓ Help", callback_data="help")],
+        [InlineKeyboardButton("⚙️ Toggle Translation", callback_data="toggle")]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await query.edit_message_text(
-        message_text,
-        reply_markup=reply_markup
-    )
+    try:
+        await query.edit_message_text(
+            welcome_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Error in back callback: {e}")
 
 # Main message handler for translation
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming messages for translation"""
-    # Validate message
-    if not update.message or not update.message.text:
-        return
-    
-    text = update.message.text
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    
-    # Skip bot commands
-    if text.startswith('/'):
-        return
-    
-    # Skip very short messages
-    if len(text.strip()) < 3:
-        return
-    
-    # Check user settings
-    settings = get_user_settings(user_id)
-    if not settings['auto_translate']:
-        return
-    
     try:
+        # Validate message
+        if not update.message or not update.message.text:
+            return
+        
+        text = update.message.text
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+        
+        # Skip bot commands
+        if text.startswith('/'):
+            return
+        
+        # Skip very short messages
+        if len(text.strip()) < 3:
+            return
+        
+        # Check user settings
+        settings = get_user_settings(user_id)
+        if not settings['auto_translate']:
+            return
+        
         # Detect language
         detected_lang = detect_language(text)
         
@@ -342,7 +388,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Don't send error messages to users - just log them
 
 # Main application function
-def main():
+async def main():
     """Main function to start the bot"""
     # Get bot token from environment variable
     BOT_TOKEN = os.environ.get('BOT_TOKEN')
@@ -354,12 +400,7 @@ def main():
     
     logger.info("🚀 Starting Telegram Translation Bot...")
     
-    # Start Flask server in background (required for Render)
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info("✅ Flask server started for Render")
-    
-    # Create bot application
+    # Create bot application with proper async context
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Add command handlers
@@ -380,11 +421,37 @@ def main():
     logger.info("🌍 Translation Bot is now running 24/7!")
     logger.info("💬 Ready to translate Ukrainian ↔ English")
     
-    # Run the bot
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True
-    )
+    # Run the bot with proper async handling
+    async with application:
+        await application.start()
+        await application.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
+        
+        # Keep running
+        try:
+            await asyncio.Event().wait()
+        except KeyboardInterrupt:
+            logger.info("Shutting down...")
+        finally:
+            await application.updater.stop()
+            await application.stop()
+
+def run_bot():
+    """Run the bot in async context"""
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot error: {e}")
 
 if __name__ == '__main__':
-    main()
+    # Start Flask server in background thread (required for Render)
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("✅ Flask server started for Render")
+    
+    # Start the bot
+    run_bot()

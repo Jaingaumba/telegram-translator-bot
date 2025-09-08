@@ -5,7 +5,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import requests
 import re
 from flask import Flask, request
-import asyncio
 
 # Configure logging
 logging.basicConfig(
@@ -19,6 +18,15 @@ user_settings = {}
 
 # Initialize Flask app
 app = Flask(__name__)
+
+# Get bot token from environment variable
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+if not BOT_TOKEN:
+    logger.error("❌ ERROR: BOT_TOKEN environment variable not set!")
+    raise ValueError("BOT_TOKEN not set in environment variables")
+
+# Build the application
+application = Application.builder().token(BOT_TOKEN).build()
 
 # Language detection function
 def detect_language(text):
@@ -250,6 +258,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error handling message: {e}")
 
+# Add all handlers to the application
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("toggle", toggle))
+application.add_handler(CommandHandler("help", help_command))
+application.add_handler(CallbackQueryHandler(button_callback))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+# Initialize the application
+application.initialize()
+
 # Flask Routes for Render
 @app.route('/')
 def home():
@@ -266,11 +284,8 @@ def webhook():
         json_data = request.get_json()
         update = Update.de_json(json_data, application.bot)
         
-        # Run the async processing in an event loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(application.process_update(update))
-        loop.close()
+        # Process the update
+        application.process_update(update)
         
         return 'OK', 200
     except Exception as e:
@@ -302,56 +317,16 @@ def set_webhook():
         logger.error(f"❌ Exception setting webhook: {e}")
         return False
 
-# Global application instance
-application = None
+# Main entry point
+if __name__ == '__main__':
+    logger.info("🚀 Starting Telegram Translation Bot on Render...")
 
-# Main function to run the bot
-def main():
-    """Main function to start the bot"""
-    global application
-    
-    # Get bot token from environment variable
-    BOT_TOKEN = os.environ.get('BOT_TOKEN')
-    
-    if not BOT_TOKEN:
-        logger.error("❌ ERROR: BOT_TOKEN environment variable not set!")
-        logger.error("Please set your bot token in Render dashboard > Environment")
-        return
-    
-    logger.info("🚀 Starting Telegram Translation Bot...")
-    
-    # Create bot application
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("toggle", toggle))
-    application.add_handler(CommandHandler("help", help_command))
-    
-    # Add button callback handler
-    application.add_handler(CallbackQueryHandler(button_callback))
-    
-    # Add message handler for translation
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-    )
-    
     # Set the webhook
     webhook_set = set_webhook()
     if not webhook_set:
         logger.error("Failed to set webhook. Check your BOT_TOKEN and RENDER_EXTERNAL_URL.")
-        return
-    
-    logger.info("✅ Bot handlers configured")
-    logger.info("🌍 Translation Bot is now running 24/7!")
-    logger.info("💬 Ready to translate Ukrainian ↔ English")
 
-# Run the application
-if __name__ == '__main__':
-    # Initialize the bot
-    main()
-    
     # Start the Flask server
     port = int(os.environ.get('PORT', 10000))
     logger.info(f"🌐 Starting Flask server on port {port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)

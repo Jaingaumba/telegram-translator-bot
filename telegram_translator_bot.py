@@ -1,11 +1,12 @@
+import os
 import asyncio
 import logging
-import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from googletrans import Translator
 import re
-import json
+import threading
+from flask import Flask
 
 # Configure logging
 logging.basicConfig(
@@ -16,9 +17,22 @@ logger = logging.getLogger(__name__)
 
 # Initialize translator
 translator = Translator()
-
-# Store user preferences (in memory for cloud deployment)
 user_settings = {}
+
+# Flask app for Render (keeps bot awake)
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "🌍 Telegram Translation Bot is running! ✅"
+
+@app.route('/health')
+def health():
+    return "OK"
+
+def run_flask():
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
 
 # Detect language
 def detect_language(text):
@@ -33,7 +47,7 @@ async def translate_text(text, target_lang):
     try:
         # Clean text (remove extra whitespace)
         cleaned_text = re.sub(r'\s+', ' ', text.strip())
-        if not cleaned_text:
+        if not cleaned_text or len(cleaned_text) < 3:
             return text
             
         result = translator.translate(cleaned_text, dest=target_lang)
@@ -354,10 +368,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_lang = 'en'
         translation_needed = True
     
-    # Skip translation if it's user's own message and they don't want it translated
-    if user_id == update.effective_user.id and not settings['translate_own_messages']:
-        translation_needed = False
-    
     if not translation_needed:
         return
     
@@ -386,13 +396,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Main function
 def main():
-    # Get bot token from environment variable (for Railway deployment)
+    # Get bot token from environment variable (for Render deployment)
     BOT_TOKEN = os.environ.get('BOT_TOKEN')
     
     if not BOT_TOKEN:
         logger.error("❌ ERROR: BOT_TOKEN environment variable not set!")
-        logger.error("Please set your bot token in Railway dashboard")
+        logger.error("Please set your bot token in Render dashboard")
         return
+    
+    # Start Flask server in background (required for Render)
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
     
     # Create application
     app = Application.builder().token(BOT_TOKEN).build()
@@ -406,8 +420,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # Start the bot
-    logger.info("🚀 Bot starting...")
-    logger.info("Bot is running 24/7 on Railway!")
+    logger.info("🚀 Bot starting on Render...")
+    logger.info("Bot is running 24/7 with auto-wake functionality!")
     
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

@@ -5,7 +5,7 @@ import threading
 import asyncio
 from typing import List
 from flask import Flask, request, jsonify
-from concurrent.futures import ThreadPoolExecutor
+import concurrent.futures
 
 from deep_translator import GoogleTranslator
 from telegram import Update
@@ -23,23 +23,13 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-# Suppress HTTP logs for cleaner output
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 # -------------------- Config --------------------
-# Multiple ways to get bot token (Render-specific)
-TELEGRAM_BOT_TOKEN = (
-    os.getenv("TELEGRAM_BOT_TOKEN") or 
-    os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-)
-
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 if not TELEGRAM_BOT_TOKEN:
-    logger.error("TELEGRAM_BOT_TOKEN not found!")
-    logger.error(f"Available env vars: {sorted([k for k in os.environ.keys() if 'TOKEN' in k or 'TELEGRAM' in k])}")
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN environment variable")
 
-# URL handling
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 if not RENDER_EXTERNAL_URL:
     service_name = os.getenv("RENDER_SERVICE_NAME", "")
@@ -51,7 +41,6 @@ if not RENDER_EXTERNAL_URL:
 PUBLIC_URL = RENDER_EXTERNAL_URL.rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 
-logger.info(f"Bot Token: {'*' * (len(TELEGRAM_BOT_TOKEN) - 8) + TELEGRAM_BOT_TOKEN[-8:]}")
 logger.info(f"Webhook URL: {PUBLIC_URL}/webhook")
 
 # Constants
@@ -65,21 +54,18 @@ MODE_TO_EN = "to_en"
 chat_modes = {}
 telegram_app = None
 bot_loop = None
-executor = ThreadPoolExecutor(max_workers=4)
 
 # Language detection
 UA_CYRILLIC_RE = re.compile(r"[А-Яа-яІіЇїЄєҐґ]")
 
-# -------------------- Flask Setup --------------------
+# Flask app
 app = Flask(__name__)
 
 # -------------------- Utilities --------------------
 def detect_direction(text: str) -> str:
-    """Detect if text contains Ukrainian/Cyrillic characters"""
     return MODE_TO_EN if UA_CYRILLIC_RE.search(text) else MODE_TO_UK
 
 def chunk_text(text: str, limit: int) -> List[str]:
-    """Chunk text safely"""
     if len(text) <= limit:
         return [text]
 
@@ -127,8 +113,8 @@ def chunk_text(text: str, limit: int) -> List[str]:
     push()
     return [chunk for chunk in chunks if chunk.strip()]
 
-def translate_text(text: str, direction: str) -> str:
-    """Translate text using Google Translate"""
+def translate_text_sync(text: str, direction: str) -> str:
+    """Synchronous translation function"""
     try:
         if direction == MODE_TO_UK:
             source, target = "en", "uk"
@@ -158,19 +144,6 @@ def translate_text(text: str, direction: str) -> str:
         logger.error(f"Translation error: {e}")
         return text
 
-def run_async_in_thread(coro):
-    """Run async function in the bot's event loop thread"""
-    if bot_loop and bot_loop.is_running():
-        future = asyncio.run_coroutine_threadsafe(coro, bot_loop)
-        try:
-            return future.result(timeout=30)
-        except Exception as e:
-            logger.error(f"Async execution error: {e}")
-            return None
-    else:
-        logger.error("Bot event loop not running")
-        return None
-
 async def send_long_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     """Send long text by chunking"""
     parts = chunk_text(text, TG_SAFE)
@@ -190,7 +163,6 @@ async def send_long_text(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
 
 # -------------------- Handlers --------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
     try:
         chat_id = update.effective_chat.id
         chat_modes[chat_id] = MODE_AUTO
@@ -216,7 +188,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Hello! I'm a translation bot. Send me text to translate!")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command"""
     try:
         help_text = (
             "**Available Commands:**\n\n"
@@ -232,7 +203,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Available commands: /auto /to_en /to_uk /help")
 
 async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set mode to auto-detect"""
     try:
         chat_modes[update.effective_chat.id] = MODE_AUTO
         await update.message.reply_text("✅ Mode set to **auto-detect**", parse_mode='Markdown')
@@ -241,7 +211,6 @@ async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Mode set to auto-detect")
 
 async def to_en_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set mode to Ukrainian -> English"""
     try:
         chat_modes[update.effective_chat.id] = MODE_TO_EN
         await update.message.reply_text("✅ Mode set to **Ukrainian → English**", parse_mode='Markdown')
@@ -250,7 +219,6 @@ async def to_en_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Mode set to Ukrainian → English")
 
 async def to_uk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set mode to English -> Ukrainian"""
     try:
         chat_modes[update.effective_chat.id] = MODE_TO_UK
         await update.message.reply_text("✅ Mode set to **English → Ukrainian**", parse_mode='Markdown')
@@ -278,8 +246,10 @@ async def translate_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
         
-        # Run translation in thread pool to avoid blocking
-        translated = await context.application.run_in_threadpool(translate_text, text, direction)
+        # Use a proper thread pool executor to run synchronous translation
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            loop = asyncio.get_event_loop()
+            translated = await loop.run_in_executor(executor, translate_text_sync, text, direction)
         
         if not translated or translated == text:
             if mode == MODE_AUTO:
@@ -298,12 +268,10 @@ async def translate_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log errors"""
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 # -------------------- Bot Setup --------------------
 def create_application() -> Application:
-    """Create Telegram application"""
     return (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
@@ -315,7 +283,6 @@ def create_application() -> Application:
     )
 
 async def setup_bot():
-    """Setup bot with handlers"""
     global telegram_app
     
     telegram_app = create_application()
@@ -344,7 +311,6 @@ async def setup_bot():
     return telegram_app
 
 def run_bot_in_thread():
-    """Run bot in separate thread with its own event loop"""
     global bot_loop
     
     def bot_thread():
@@ -364,7 +330,7 @@ def run_bot_in_thread():
     bot_thread_obj = threading.Thread(target=bot_thread, daemon=True)
     bot_thread_obj.start()
     
-    # Wait a moment for initialization
+    # Wait for initialization
     import time
     time.sleep(3)
     
@@ -376,7 +342,6 @@ def run_bot_in_thread():
 # -------------------- Flask Routes --------------------
 @app.route("/", methods=["GET"])
 def index():
-    """Health check endpoint"""
     return jsonify({
         "status": "Telegram Translator Bot is running!",
         "webhook_url": f"{PUBLIC_URL}/webhook",
@@ -385,7 +350,6 @@ def index():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Handle Telegram webhooks"""
     try:
         if not telegram_app or not bot_loop:
             logger.error("Bot not initialized")
@@ -399,14 +363,20 @@ def webhook():
         if not update:
             return jsonify({"error": "Invalid update"}), 400
         
-        # Schedule update processing in bot's event loop
+        # Process update in bot's event loop
         future = asyncio.run_coroutine_threadsafe(
             telegram_app.process_update(update), 
             bot_loop
         )
         
-        # Don't wait for completion to avoid blocking Flask
-        executor.submit(lambda: future.result(timeout=30))
+        # Wait briefly for processing to start but don't block Flask
+        try:
+            future.result(timeout=0.1)
+        except concurrent.futures.TimeoutError:
+            # This is fine, processing will continue in background
+            pass
+        except Exception as e:
+            logger.error(f"Update processing error: {e}")
         
         return jsonify({"status": "ok"})
         
@@ -416,14 +386,12 @@ def webhook():
 
 @app.route("/set_webhook", methods=["POST", "GET"])
 def set_webhook():
-    """Manually set webhook (for testing)"""
     try:
-        if not telegram_app:
+        if not telegram_app or not bot_loop:
             return jsonify({"error": "Bot not initialized"}), 500
             
         webhook_url = f"{PUBLIC_URL}/webhook"
         
-        # Run in bot's event loop
         future = asyncio.run_coroutine_threadsafe(
             telegram_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True),
             bot_loop
@@ -439,18 +407,8 @@ def set_webhook():
         logger.error(f"Set webhook error: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route("/health", methods=["GET"])
-def health():
-    """Health check for monitoring"""
-    return jsonify({
-        "status": "healthy",
-        "bot_running": telegram_app is not None,
-        "loop_running": bot_loop is not None and bot_loop.is_running()
-    })
-
 # -------------------- Main --------------------
 def main():
-    """Main function"""
     logger.info("🚀 Starting Telegram Translator Bot...")
     
     try:
@@ -464,11 +422,6 @@ def main():
     except Exception as e:
         logger.error(f"❌ Startup failed: {e}")
         raise
-    finally:
-        # Cleanup
-        if bot_loop and bot_loop.is_running():
-            bot_loop.call_soon_threadsafe(bot_loop.stop)
-        executor.shutdown(wait=True)
 
 if __name__ == "__main__":
     main()

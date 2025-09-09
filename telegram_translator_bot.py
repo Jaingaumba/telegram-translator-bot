@@ -3,6 +3,7 @@ import re
 import logging
 from typing import List
 import asyncio
+from flask import Flask, request, jsonify
 
 from deep_translator import GoogleTranslator
 from telegram import Update
@@ -22,37 +23,56 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # -------------------- Config --------------------
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+# Try multiple ways to get the bot token (Render-specific)
+TELEGRAM_BOT_TOKEN = (
+    os.getenv("TELEGRAM_BOT_TOKEN") or 
+    os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+)
+
 if not TELEGRAM_BOT_TOKEN:
+    logger.error("TELEGRAM_BOT_TOKEN not found in environment variables")
+    logger.error(f"Available env vars: {list(os.environ.keys())}")
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN environment variable")
 
-# Get the Render URL from environment or use a placeholder
-PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
-if not PUBLIC_URL:
-    # Try to construct from Render service name
-    service_name = os.environ.get("RENDER_SERVICE_NAME", "your-service-name")
-    PUBLIC_URL = f"https://{service_name}.onrender.com"
+# Render-specific URL handling
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+if not RENDER_EXTERNAL_URL:
+    # Try to get from Render's automatic variables
+    service_name = os.getenv("RENDER_SERVICE_NAME", "")
+    if service_name:
+        RENDER_EXTERNAL_URL = f"https://{service_name}.onrender.com"
+    else:
+        # Fallback - user needs to set this manually
+        RENDER_EXTERNAL_URL = "https://your-service-name.onrender.com"
 
-PUBLIC_URL = PUBLIC_URL.rstrip("/")
-
-# Render provides a port in $PORT for web services
+PUBLIC_URL = RENDER_EXTERNAL_URL.rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
+
+logger.info(f"Bot Token: {'*' * (len(TELEGRAM_BOT_TOKEN) - 8) + TELEGRAM_BOT_TOKEN[-8:]}")
+logger.info(f"Public URL: {PUBLIC_URL}")
+logger.info(f"Port: {PORT}")
 
 # Telegram message safety
 TG_MAX = 4096
-TG_SAFE = 4000  # safety margin below hard limit
-TRANSLATE_CHUNK = 1800  # conservative chunk size for translation backend
+TG_SAFE = 4000
+TRANSLATE_CHUNK = 1800
 
 # Modes
 MODE_AUTO = "auto"
 MODE_TO_UK = "to_uk"
 MODE_TO_EN = "to_en"
 
-# Simple per-chat mode store (resets when app restarts)
+# Chat modes storage
 chat_modes = {}
 
-# Heuristic: detect Ukrainian/Cyrillic
+# Language detection regex
 UA_CYRILLIC_RE = re.compile(r"[А-Яа-яІіЇїЄєҐґ]")
+
+# -------------------- Flask App Setup --------------------
+app = Flask(__name__)
+
+# Global application variable
+telegram_app = None
 
 # -------------------- Utilities --------------------
 def detect_direction(text: str) -> str:
@@ -60,13 +80,11 @@ def detect_direction(text: str) -> str:
     return MODE_TO_EN if UA_CYRILLIC_RE.search(text) else MODE_TO_UK
 
 def chunk_text(text: str, limit: int) -> List[str]:
-    """
-    Chunk text safely by paragraphs -> sentences -> words, keeping order and not breaking words.
-    """
+    """Chunk text safely by paragraphs -> sentences -> words"""
     if len(text) <= limit:
         return [text]
 
-    chunks: List[str] = []
+    chunks = []
     current = ""
 
     def push():
@@ -75,21 +93,20 @@ def chunk_text(text: str, limit: int) -> List[str]:
             chunks.append(current.strip())
         current = ""
 
-    # First try splitting by paragraphs (double newlines)
+    # Split by paragraphs first
     paragraphs = text.split('\n\n')
     
     for para in paragraphs:
-        if len(current) + len(para) + 2 <= limit:  # +2 for \n\n
+        if len(current) + len(para) + 2 <= limit:
             if current:
                 current += '\n\n' + para
             else:
                 current = para
         else:
-            # Push current chunk if it exists
             push()
             
-            # If paragraph is too long, split by sentences
             if len(para) > limit:
+                # Split by sentences
                 sentences = re.split(r'(?<=[.!?])\s+', para)
                 for sentence in sentences:
                     if len(current) + len(sentence) + 1 <= limit:
@@ -102,7 +119,7 @@ def chunk_text(text: str, limit: int) -> List[str]:
                         if len(sentence) <= limit:
                             current = sentence
                         else:
-                            # Split long sentence by words
+                            # Split by words
                             words = sentence.split()
                             temp = ""
                             for word in words:
@@ -121,62 +138,54 @@ def chunk_text(text: str, limit: int) -> List[str]:
     return [chunk for chunk in chunks if chunk.strip()]
 
 def translate_text(text: str, direction: str) -> str:
-    """Translate text using Google Translate via deep-translator"""
+    """Translate text using Google Translate"""
     try:
         if direction == MODE_TO_UK:
             source, target = "en", "uk"
         elif direction == MODE_TO_EN:
             source, target = "uk", "en"
         else:
-            # Auto mode - detect based on content
             if UA_CYRILLIC_RE.search(text):
                 source, target = "uk", "en"
             else:
                 source, target = "en", "uk"
 
-        # Split text into chunks if necessary
-        in_chunks = chunk_text(text, TRANSLATE_CHUNK)
-        out_chunks: List[str] = []
+        chunks = chunk_text(text, TRANSLATE_CHUNK)
+        translated_chunks = []
 
-        for chunk in in_chunks:
+        for chunk in chunks:
             if not chunk.strip():
                 continue
             
             try:
-                # Use GoogleTranslator from deep-translator
                 translator = GoogleTranslator(source=source, target=target)
                 result = translator.translate(chunk)
-                
                 if result and result.strip():
-                    out_chunks.append(result)
+                    translated_chunks.append(result)
                 else:
-                    out_chunks.append(chunk)  # fallback to original if translation fails
-                    
+                    translated_chunks.append(chunk)
             except Exception as e:
                 logger.error(f"Translation error for chunk: {e}")
-                out_chunks.append(chunk)  # fallback to original
+                translated_chunks.append(chunk)
 
-        final_result = '\n\n'.join(out_chunks).strip()
-        return final_result if final_result else text
+        return '\n\n'.join(translated_chunks).strip() or text
         
     except Exception as e:
         logger.error(f"Translation error: {e}")
-        return text  # Return original text if translation fails
+        return text
 
 async def send_long_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Send long text by chunking it into multiple messages"""
+    """Send long text by chunking it"""
     parts = chunk_text(text, TG_SAFE)
     if not parts:
         return
     
     try:
-        # Reply to the first message, then send follow-ups
         await update.message.reply_text(parts[0])
         for part in parts[1:]:
             await context.bot.send_message(chat_id=update.effective_chat.id, text=part)
     except Exception as e:
         logger.error(f"Error sending message: {e}")
-        # Fallback: try to send a simple error message
         try:
             await update.message.reply_text("❌ Failed to send translation. Please try again.")
         except:
@@ -260,45 +269,32 @@ async def translate_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         text = update.message.text.strip()
         
-        # Skip commands
-        if text.startswith("/"):
-            return
-        
-        # Skip very short messages
-        if len(text) < 2:
+        if text.startswith("/") or len(text) < 2:
             return
 
         chat_id = update.effective_chat.id
         mode = chat_modes.get(chat_id, MODE_AUTO)
         
-        # Determine translation direction
-        if mode == MODE_AUTO:
-            direction = detect_direction(text)
-        else:
-            direction = mode
+        direction = detect_direction(text) if mode == MODE_AUTO else mode
 
-        # Show typing indicator
         try:
             await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         except:
             pass
         
-        # Translate text in a thread to avoid blocking
         translated = await context.application.run_in_threadpool(translate_text, text, direction)
         
         if not translated or translated == text:
-            # If translation failed or returned same text
             if mode == MODE_AUTO:
                 await update.message.reply_text("🤔 I couldn't detect the language. Try /to_en or /to_uk")
             else:
                 await update.message.reply_text("⚠️ Translation failed. Please try again.")
             return
         
-        # Send translated text
         await send_long_text(update, context, translated)
         
     except Exception as e:
-        logger.error(f"Translation failed for chat {update.effective_chat.id if update.effective_chat else 'unknown'}: {e}")
+        logger.error(f"Translation failed: {e}")
         try:
             await update.message.reply_text("❌ Translation error. Please try again later.")
         except:
@@ -308,11 +304,58 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     """Log errors"""
     logger.error("Exception while handling an update:", exc_info=context.error)
 
-# -------------------- App setup --------------------
+# -------------------- Flask Routes --------------------
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({"status": "Telegram Translator Bot is running!", "webhook_url": f"{PUBLIC_URL}/webhook"})
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    """Handle webhook updates"""
+    try:
+        if not telegram_app:
+            logger.error("Telegram app not initialized")
+            return jsonify({"error": "Bot not initialized"}), 500
+            
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        
+        # Process update in async context
+        asyncio.create_task(telegram_app.process_update(update))
+        
+        return jsonify({"status": "ok"})
+        
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/set_webhook", methods=["POST"])
+def set_webhook():
+    """Set webhook manually"""
+    try:
+        if not telegram_app:
+            return jsonify({"error": "Bot not initialized"}), 500
+            
+        webhook_url = f"{PUBLIC_URL}/webhook"
+        
+        # Use synchronous method
+        import requests
+        
+        set_webhook_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+        response = requests.post(set_webhook_url, json={"url": webhook_url})
+        
+        if response.ok:
+            return jsonify({"status": "Webhook set successfully", "url": webhook_url})
+        else:
+            return jsonify({"error": "Failed to set webhook", "response": response.text}), 400
+            
+    except Exception as e:
+        logger.error(f"Set webhook error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# -------------------- Bot Setup --------------------
 def create_application() -> Application:
     """Create and configure the Telegram application"""
-    # Build application with proper timeout settings
-    app = (
+    return (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
         .read_timeout(30)
@@ -321,44 +364,54 @@ def create_application() -> Application:
         .pool_timeout(30)
         .build()
     )
+
+async def setup_application():
+    """Setup the Telegram application with handlers"""
+    global telegram_app
+    
+    telegram_app = create_application()
     
     # Add handlers
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("auto", auto_cmd))
-    app.add_handler(CommandHandler("to_en", to_en_cmd))
-    app.add_handler(CommandHandler("to_uk", to_uk_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, translate_msg))
+    telegram_app.add_handler(CommandHandler("start", start_cmd))
+    telegram_app.add_handler(CommandHandler("help", help_cmd))
+    telegram_app.add_handler(CommandHandler("auto", auto_cmd))
+    telegram_app.add_handler(CommandHandler("to_en", to_en_cmd))
+    telegram_app.add_handler(CommandHandler("to_uk", to_uk_cmd))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, translate_msg))
+    telegram_app.add_error_handler(error_handler)
     
-    # Add error handler
-    app.add_error_handler(error_handler)
+    # Initialize the application
+    await telegram_app.initialize()
+    await telegram_app.start()
     
-    return app
+    # Set webhook
+    webhook_url = f"{PUBLIC_URL}/webhook"
+    await telegram_app.bot.set_webhook(
+        url=webhook_url,
+        drop_pending_updates=True
+    )
+    
+    logger.info(f"Webhook set to: {webhook_url}")
+    return telegram_app
 
 def main():
-    """Main function to run the bot"""
-    logger.info("Starting Telegram Translator Bot...")
-    logger.info(f"Using webhook URL: {PUBLIC_URL}")
+    """Main function"""
+    logger.info("Starting Telegram Translator Bot with Flask...")
     
-    # Create application
-    application = create_application()
-    
-    # Always use webhook for Render deployment
-    logger.info("Running in webhook mode")
+    # Setup the application in a new event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     
     try:
-        # Run webhook server with proper configuration
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path="webhook",
-            webhook_url=f"{PUBLIC_URL}/webhook",
-            drop_pending_updates=True,
-            stop_signals=None,  # Let Render handle shutdown signals
-        )
+        loop.run_until_complete(setup_application())
+        logger.info("Telegram application initialized successfully")
     except Exception as e:
-        logger.error(f"Failed to start webhook: {e}")
+        logger.error(f"Failed to initialize Telegram app: {e}")
         raise
+    
+    # Run Flask app
+    logger.info(f"Starting Flask server on 0.0.0.0:{PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
 
 if __name__ == "__main__":
     main()

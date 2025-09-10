@@ -3,7 +3,7 @@ import re
 import logging
 import threading
 import asyncio
-from typing import List, Tuple
+from typing import List
 from flask import Flask, request, jsonify
 import concurrent.futures
 
@@ -45,8 +45,7 @@ logger.info(f"Webhook URL: {PUBLIC_URL}/webhook")
 
 # Constants
 TG_SAFE = 4000
-TRANSLATE_CHUNK = 1500  # Reduced chunk size for better quality
-CONTEXT_OVERLAP = 200   # Overlap between chunks for context
+TRANSLATE_CHUNK = 1500  # Smaller chunks for better quality
 MODE_AUTO = "auto"
 MODE_TO_UK = "to_uk"
 MODE_TO_EN = "to_en"
@@ -56,199 +55,79 @@ chat_modes = {}
 telegram_app = None
 bot_loop = None
 
-# Enhanced language detection
+# Language detection
 UA_CYRILLIC_RE = re.compile(r"[А-Яа-яІіЇїЄєҐґ]")
-# Improved sentence boundary detection
-SENTENCE_END_RE = re.compile(r'(?<=[.!?])\s+(?=[A-ZА-ЯІЇЄҐ])')
-# Additional patterns for better sentence detection
-SENTENCE_BOUNDARIES = re.compile(r'(?<=[.!?])\s+|(?<=\.\.\.)\s+|(?<=[.!?]")\s+|(?<=[.!?]\')\s+|(?<=[.!?]\u2019)\s+')
 
 # Flask app
 app = Flask(__name__)
 
-# -------------------- Enhanced Utilities --------------------
+# -------------------- Simple & Effective Utilities --------------------
 def detect_direction(text: str) -> str:
     return MODE_TO_EN if UA_CYRILLIC_RE.search(text) else MODE_TO_UK
 
-def split_into_sentences(text: str) -> List[str]:
-    """Split text into sentences using improved regex patterns"""
-    # Handle special cases first
-    text = re.sub(r'\s+', ' ', text.strip())  # Normalize whitespace
-    
-    # Split by sentence boundaries
-    sentences = SENTENCE_BOUNDARIES.split(text)
-    
-    # Clean and filter sentences
-    cleaned_sentences = []
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if sentence and len(sentence) > 1:  # Skip very short fragments
-            cleaned_sentences.append(sentence)
-    
-    return cleaned_sentences if cleaned_sentences else [text]
-
-def smart_chunk_text(text: str, max_chunk_size: int = TRANSLATE_CHUNK, overlap_size: int = CONTEXT_OVERLAP) -> List[Tuple[str, str]]:
+def split_text_preserving_paragraphs(text: str, max_chunk_size: int) -> List[str]:
     """
-    Enhanced chunking with context overlap and sentence preservation
-    Returns list of tuples: (chunk_text, context_for_next)
+    Simple but effective: Split text by paragraphs, keep them together as much as possible
     """
     if len(text) <= max_chunk_size:
-        return [(text, "")]
-    
-    sentences = split_into_sentences(text)
-    chunks = []
-    current_chunk = ""
-    context_buffer = ""
-    
-    i = 0
-    while i < len(sentences):
-        sentence = sentences[i]
-        
-        # Check if adding this sentence would exceed limit
-        potential_chunk = current_chunk
-        if context_buffer and not current_chunk:
-            potential_chunk = context_buffer
-        
-        if potential_chunk:
-            potential_chunk += " " + sentence
-        else:
-            potential_chunk = sentence
-        
-        if len(potential_chunk) <= max_chunk_size:
-            # Add sentence to current chunk
-            if current_chunk:
-                current_chunk += " " + sentence
-            else:
-                current_chunk = context_buffer + (" " + sentence if context_buffer else sentence)
-            i += 1
-        else:
-            # Current chunk is full, save it and start new one
-            if current_chunk:
-                # Extract context for next chunk (last few sentences or chars)
-                context_for_next = extract_context(current_chunk, overlap_size)
-                chunks.append((current_chunk.strip(), context_for_next))
-                context_buffer = context_for_next
-                current_chunk = ""
-            else:
-                # Single sentence is too long, split it by words
-                word_chunks = split_long_sentence(sentence, max_chunk_size, overlap_size)
-                for j, (word_chunk, word_context) in enumerate(word_chunks):
-                    if context_buffer and j == 0:
-                        word_chunk = context_buffer + " " + word_chunk
-                    chunks.append((word_chunk.strip(), word_context))
-                    context_buffer = word_context
-                i += 1
-    
-    # Add remaining chunk
-    if current_chunk:
-        chunks.append((current_chunk.strip(), ""))
-    
-    # Clean up empty chunks
-    return [(chunk, context) for chunk, context in chunks if chunk.strip()]
-
-def extract_context(text: str, max_context_size: int) -> str:
-    """Extract context from the end of text for overlap"""
-    if len(text) <= max_context_size:
-        return text
-    
-    # Try to get complete sentences for context
-    sentences = split_into_sentences(text)
-    context = ""
-    
-    # Start from the end and work backwards
-    for sentence in reversed(sentences):
-        potential_context = sentence + (" " + context if context else "")
-        if len(potential_context) <= max_context_size:
-            context = potential_context
-        else:
-            break
-    
-    # If no complete sentences fit, take the last N characters
-    if not context:
-        context = text[-max_context_size:].strip()
-        # Try to start from a word boundary
-        space_idx = context.find(' ')
-        if space_idx > 0:
-            context = context[space_idx:].strip()
-    
-    return context
-
-def split_long_sentence(sentence: str, max_size: int, overlap_size: int) -> List[Tuple[str, str]]:
-    """Split a long sentence by words when it exceeds max_size"""
-    words = sentence.split()
-    chunks = []
-    current_chunk = ""
-    
-    for word in words:
-        potential_chunk = current_chunk + (" " + word if current_chunk else word)
-        
-        if len(potential_chunk) <= max_size:
-            current_chunk = potential_chunk
-        else:
-            if current_chunk:
-                context = extract_context(current_chunk, overlap_size)
-                chunks.append((current_chunk, context))
-                current_chunk = word
-            else:
-                # Single word is too long, just include it
-                chunks.append((word, ""))
-    
-    if current_chunk:
-        chunks.append((current_chunk, ""))
-    
-    return chunks
-
-def chunk_text(text: str, limit: int) -> List[str]:
-    """Legacy chunking function for Telegram message splitting"""
-    if len(text) <= limit:
         return [text]
-
-    chunks = []
-    current = ""
-
-    def push():
-        nonlocal current
-        if current.strip():
-            chunks.append(current.strip())
-        current = ""
-
+    
+    # Split by double newlines (paragraphs)
     paragraphs = text.split('\n\n')
     
+    chunks = []
+    current_chunk = ""
+    
     for para in paragraphs:
-        if len(current) + len(para) + 2 <= limit:
-            current += ('\n\n' + para) if current else para
-        else:
-            push()
+        para = para.strip()
+        if not para:
+            continue
             
-            if len(para) > limit:
-                sentences = split_into_sentences(para)
-                for sentence in sentences:
-                    if len(current) + len(sentence) + 1 <= limit:
-                        current += (' ' + sentence) if current else sentence
-                    else:
-                        push()
-                        if len(sentence) <= limit:
-                            current = sentence
-                        else:
-                            words = sentence.split()
-                            temp = ""
-                            for word in words:
-                                if len(temp) + len(word) + 1 <= limit:
-                                    temp += (word + ' ')
-                                else:
-                                    if temp.strip():
-                                        chunks.append(temp.strip())
-                                    temp = word + ' '
-                            if temp.strip():
-                                current = temp.strip()
+        # If adding this paragraph would exceed the limit
+        if current_chunk and len(current_chunk) + len(para) + 2 > max_chunk_size:
+            # Save current chunk and start new one
+            if current_chunk.strip():
+                chunks.append(current_chunk.strip())
+            current_chunk = para
+        else:
+            # Add paragraph to current chunk
+            if current_chunk:
+                current_chunk += "\n\n" + para
             else:
-                current = para
-
-    push()
+                current_chunk = para
+        
+        # If single paragraph is too long, split it by sentences
+        if len(current_chunk) > max_chunk_size:
+            if current_chunk.strip():
+                chunks.append(current_chunk.strip())
+            current_chunk = ""
+            
+            # Split long paragraph by sentences
+            sentences = re.split(r'(?<=[.!?])\s+', para)
+            temp_chunk = ""
+            
+            for sentence in sentences:
+                if temp_chunk and len(temp_chunk) + len(sentence) + 1 > max_chunk_size:
+                    if temp_chunk.strip():
+                        chunks.append(temp_chunk.strip())
+                    temp_chunk = sentence
+                else:
+                    if temp_chunk:
+                        temp_chunk += " " + sentence
+                    else:
+                        temp_chunk = sentence
+            
+            if temp_chunk.strip():
+                current_chunk = temp_chunk
+    
+    # Add remaining chunk
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    
     return [chunk for chunk in chunks if chunk.strip()]
 
 def translate_text_sync(text: str, direction: str) -> str:
-    """Enhanced synchronous translation with context-aware chunking"""
+    """Simple translation with paragraph preservation - no overcomplicated logic"""
     try:
         if direction == MODE_TO_UK:
             source, target = "en", "uk"
@@ -257,41 +136,27 @@ def translate_text_sync(text: str, direction: str) -> str:
         else:
             source, target = ("uk", "en") if UA_CYRILLIC_RE.search(text) else ("en", "uk")
 
-        # Use smart chunking for better context preservation
-        chunk_data = smart_chunk_text(text, TRANSLATE_CHUNK, CONTEXT_OVERLAP)
+        # Split text while preserving paragraph structure
+        chunks = split_text_preserving_paragraphs(text, TRANSLATE_CHUNK)
         translated_chunks = []
 
-        logger.info(f"Translating {len(chunk_data)} chunks with context overlap")
+        logger.info(f"Translating {len(chunks)} chunks while preserving paragraphs")
 
-        for i, (chunk, context) in enumerate(chunk_data):
+        for i, chunk in enumerate(chunks):
             if not chunk.strip():
                 continue
             
             try:
-                # For chunks with context, include it in translation for better coherence
-                text_to_translate = chunk
-                if context and i > 0:  # Don't add context to first chunk
-                    # Add context marker to help translator understand context
-                    text_to_translate = f"[Context: {context}] {chunk}"
-                    logger.debug(f"Chunk {i+1} with context: {len(context)} chars")
-                
                 translator = GoogleTranslator(source=source, target=target)
-                result = translator.translate(text_to_translate)
+                result = translator.translate(chunk)
                 
                 if result and result.strip():
-                    # If we added context, try to remove the translated context part
-                    if context and i > 0 and result.startswith('['):
-                        # Find the end of context marker and remove it
-                        context_end = result.find('] ')
-                        if context_end != -1:
-                            result = result[context_end + 2:].strip()
-                    
-                    translated_chunks.append(result)
+                    translated_chunks.append(result.strip())
                 else:
                     translated_chunks.append(chunk)
                 
-                # Small delay between chunks to avoid rate limiting
-                if i < len(chunk_data) - 1:
+                # Small delay to avoid rate limiting
+                if i < len(chunks) - 1:
                     import time
                     time.sleep(0.1)
                     
@@ -299,21 +164,76 @@ def translate_text_sync(text: str, direction: str) -> str:
                 logger.error(f"Translation error for chunk {i+1}: {e}")
                 translated_chunks.append(chunk)
 
-        # Join chunks with proper spacing
-        final_result = []
-        for chunk in translated_chunks:
-            if chunk.strip():
-                final_result.append(chunk.strip())
-        
-        return ' '.join(final_result) or text
+        # Join chunks with double newlines to preserve paragraph structure
+        return "\n\n".join(translated_chunks) if translated_chunks else text
         
     except Exception as e:
         logger.error(f"Translation error: {e}")
         return text
 
+def chunk_text_for_telegram(text: str, limit: int = TG_SAFE) -> List[str]:
+    """Split text for Telegram while preserving paragraph breaks"""
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    current = ""
+
+    # Split by paragraphs first
+    paragraphs = text.split('\n\n')
+    
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+            
+        # If adding this paragraph would exceed limit
+        if current and len(current) + len(para) + 2 > limit:
+            if current.strip():
+                chunks.append(current.strip())
+            current = para
+        else:
+            if current:
+                current += "\n\n" + para
+            else:
+                current = para
+        
+        # If single paragraph is too long, split by sentences
+        if len(current) > limit:
+            if '\n\n' in current:
+                # Multiple paragraphs in current, save what we can
+                parts = current.split('\n\n')
+                save_parts = '\n\n'.join(parts[:-1])
+                if save_parts.strip():
+                    chunks.append(save_parts.strip())
+                current = parts[-1]
+            
+            # Split current by sentences if still too long
+            if len(current) > limit:
+                sentences = re.split(r'(?<=[.!?])\s+', current)
+                temp = ""
+                
+                for sentence in sentences:
+                    if temp and len(temp) + len(sentence) + 1 > limit:
+                        if temp.strip():
+                            chunks.append(temp.strip())
+                        temp = sentence
+                    else:
+                        if temp:
+                            temp += " " + sentence
+                        else:
+                            temp = sentence
+                
+                current = temp if temp.strip() else ""
+    
+    if current.strip():
+        chunks.append(current.strip())
+    
+    return [chunk for chunk in chunks if chunk.strip()]
+
 async def send_long_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Send long text by chunking"""
-    parts = chunk_text(text, TG_SAFE)
+    """Send long text by chunking while preserving paragraphs"""
+    parts = chunk_text_for_telegram(text, TG_SAFE)
     if not parts:
         return
     
@@ -335,43 +255,44 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_modes[chat_id] = MODE_AUTO
         
         welcome_text = (
-            "🔄 **Enhanced Telegram Translator Bot**\n\n"
-            "I translate between English and Ukrainian with improved context awareness!\n\n"
-            "**New Features:**\n"
-            "• 🧠 Smart context-aware chunking\n"
-            "• 📝 Sentence boundary preservation\n"
-            "• 🔗 Context overlap for better coherence\n"
-            "• 🎯 Enhanced translation quality\n\n"
+            "🔄 **Paragraph-Preserving Telegram Translator**\n\n"
+            "I translate between English and Ukrainian while keeping your paragraph structure intact!\n\n"
+            "**Features:**\n"
+            "• 📝 Preserves paragraph breaks (\\n\\n)\n"
+            "• 🎯 Smart chunking for better quality\n"
+            "• 🔄 Auto-detect or manual language selection\n\n"
             "**How it works:**\n"
-            "• Send any text - I'll auto-detect and translate\n"
+            "• Send any text with paragraphs\n"
             "• Latin text → Ukrainian\n"
-            "• Cyrillic text → English\n\n"
+            "• Cyrillic text → English\n"
+            "• Paragraph structure maintained!\n\n"
             "**Commands:**\n"
             "• /auto - Auto-detect language (default)\n"
             "• /to_en - Force Ukrainian → English\n"
             "• /to_uk - Force English → Ukrainian\n"
             "• /help - Show help\n\n"
-            "Ready to translate with enhanced context! 🚀"
+            "Ready to translate with perfect formatting! 🚀"
         )
         
         await update.message.reply_text(welcome_text, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Error in start command: {e}")
-        await update.message.reply_text("Hello! I'm an enhanced translation bot. Send me text to translate!")
+        await update.message.reply_text("Hello! I'm a paragraph-preserving translation bot. Send me text to translate!")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         help_text = (
-            "**Enhanced Translation Bot Commands:**\n\n"
+            "**Paragraph-Preserving Translation Bot**\n\n"
+            "**Commands:**\n"
             "/auto – Auto-detect language per message\n"
             "/to_en – Force Ukrainian → English\n"
             "/to_uk – Force English → Ukrainian\n"
             "/help – Show this help\n\n"
-            "**New Features:**\n"
-            "• Smart chunking preserves sentence boundaries\n"
-            "• Context overlap for better translation coherence\n"
-            "• Improved handling of long texts\n\n"
-            "Just send any text and I'll translate it with enhanced context awareness!"
+            "**Key Feature:**\n"
+            "✅ Maintains paragraph breaks in translations\n"
+            "✅ Preserves text structure and formatting\n"
+            "✅ Smart chunking for long texts\n\n"
+            "Just send text with paragraphs and see the magic! 📝"
         )
         await update.message.reply_text(help_text, parse_mode='Markdown')
     except Exception as e:
@@ -381,7 +302,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_modes[update.effective_chat.id] = MODE_AUTO
-        await update.message.reply_text("✅ Mode set to **auto-detect** with context awareness", parse_mode='Markdown')
+        await update.message.reply_text("✅ Mode: **Auto-detect** with paragraph preservation", parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Error in auto command: {e}")
         await update.message.reply_text("✅ Mode set to auto-detect")
@@ -389,7 +310,7 @@ async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def to_en_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_modes[update.effective_chat.id] = MODE_TO_EN
-        await update.message.reply_text("✅ Mode set to **Ukrainian → English** with context preservation", parse_mode='Markdown')
+        await update.message.reply_text("✅ Mode: **Ukrainian → English** with paragraph preservation", parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Error in to_en command: {e}")
         await update.message.reply_text("✅ Mode set to Ukrainian → English")
@@ -397,13 +318,13 @@ async def to_en_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def to_uk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_modes[update.effective_chat.id] = MODE_TO_UK
-        await update.message.reply_text("✅ Mode set to **English → Ukrainian** with context preservation", parse_mode='Markdown')
+        await update.message.reply_text("✅ Mode: **English → Ukrainian** with paragraph preservation", parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Error in to_uk command: {e}")
         await update.message.reply_text("✅ Mode set to English → Ukrainian")
 
 async def translate_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages and translate them with enhanced context awareness"""
+    """Handle text messages and translate them while preserving paragraph structure"""
     try:
         if not update.message or not update.message.text:
             return
@@ -422,11 +343,12 @@ async def translate_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
         
-        # Log translation details for debugging
-        logger.info(f"Translating {len(text)} chars with {len(text.split(chr(10)+chr(10)))} paragraphs in mode '{mode}' -> '{direction}'")
+        # Count paragraphs for logging
+        paragraph_count = len([p for p in text.split('\n\n') if p.strip()])
+        logger.info(f"Translating {len(text)} chars, {paragraph_count} paragraphs, mode: {mode} -> {direction}")
         
-        # Use enhanced thread pool executor for better performance
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        # Use thread pool for translation
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             loop = asyncio.get_event_loop()
             translated = await loop.run_in_executor(executor, translate_text_sync, text, direction)
         
@@ -437,7 +359,11 @@ async def translate_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("⚠️ Translation failed. Please try again.")
             return
         
-        logger.info(f"Translation completed: {len(translated)} chars output")
+        # Verify paragraph structure is preserved
+        original_para_count = len([p for p in text.split('\n\n') if p.strip()])
+        translated_para_count = len([p for p in translated.split('\n\n') if p.strip()])
+        logger.info(f"Translation completed: {original_para_count} → {translated_para_count} paragraphs")
+        
         await send_long_text(update, context, translated)
         
     except Exception as e:
@@ -487,7 +413,7 @@ async def setup_bot():
         drop_pending_updates=True
     )
     
-    logger.info(f"✅ Enhanced webhook set to: {webhook_url}")
+    logger.info(f"✅ Paragraph-preserving bot webhook set: {webhook_url}")
     return telegram_app
 
 def run_bot_in_thread():
@@ -500,11 +426,10 @@ def run_bot_in_thread():
         
         try:
             bot_loop.run_until_complete(setup_bot())
-            logger.info("✅ Enhanced bot initialized successfully")
-            # Keep the loop running
+            logger.info("✅ Paragraph-preserving bot initialized successfully")
             bot_loop.run_forever()
         except Exception as e:
-            logger.error(f"❌ Enhanced bot initialization failed: {e}")
+            logger.error(f"❌ Bot initialization failed: {e}")
             raise
     
     bot_thread_obj = threading.Thread(target=bot_thread, daemon=True)
@@ -515,30 +440,25 @@ def run_bot_in_thread():
     time.sleep(3)
     
     if not bot_loop or not telegram_app:
-        raise RuntimeError("Enhanced bot initialization failed")
+        raise RuntimeError("Bot initialization failed")
     
-    logger.info("✅ Enhanced bot thread started successfully")
+    logger.info("✅ Paragraph-preserving bot thread started successfully")
 
 # -------------------- Flask Routes --------------------
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
-        "status": "Enhanced Telegram Translator Bot is running!",
+        "status": "Paragraph-Preserving Telegram Translator Bot is running!",
         "webhook_url": f"{PUBLIC_URL}/webhook",
         "bot_initialized": telegram_app is not None,
-        "features": [
-            "Context-aware chunking",
-            "Sentence boundary preservation", 
-            "Smart overlap between chunks",
-            "Enhanced translation quality"
-        ]
+        "key_feature": "Maintains paragraph structure in translations"
     })
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
         if not telegram_app or not bot_loop:
-            logger.error("Enhanced bot not initialized")
+            logger.error("Bot not initialized")
             return jsonify({"error": "Bot not initialized"}), 500
             
         json_data = request.get_json(force=True)
@@ -555,11 +475,10 @@ def webhook():
             bot_loop
         )
         
-        # Wait briefly for processing to start but don't block Flask
+        # Don't block Flask
         try:
             future.result(timeout=0.1)
         except concurrent.futures.TimeoutError:
-            # This is fine, processing will continue in background
             pass
         except Exception as e:
             logger.error(f"Update processing error: {e}")
@@ -574,7 +493,7 @@ def webhook():
 def set_webhook():
     try:
         if not telegram_app or not bot_loop:
-            return jsonify({"error": "Enhanced bot not initialized"}), 500
+            return jsonify({"error": "Bot not initialized"}), 500
             
         webhook_url = f"{PUBLIC_URL}/webhook"
         
@@ -585,9 +504,9 @@ def set_webhook():
         
         success = future.result(timeout=10)
         if success:
-            return jsonify({"status": "Enhanced webhook set successfully", "url": webhook_url})
+            return jsonify({"status": "Paragraph-preserving webhook set successfully", "url": webhook_url})
         else:
-            return jsonify({"error": "Failed to set enhanced webhook"}), 400
+            return jsonify({"error": "Failed to set webhook"}), 400
             
     except Exception as e:
         logger.error(f"Set webhook error: {e}")
@@ -595,7 +514,7 @@ def set_webhook():
 
 # -------------------- Main --------------------
 def main():
-    logger.info("🚀 Starting Enhanced Telegram Translator Bot...")
+    logger.info("🚀 Starting Paragraph-Preserving Telegram Translator Bot...")
     
     try:
         # Initialize bot in separate thread
@@ -606,7 +525,7 @@ def main():
         app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
         
     except Exception as e:
-        logger.error(f"❌ Enhanced startup failed: {e}")
+        logger.error(f"❌ Startup failed: {e}")
         raise
 
 if __name__ == "__main__":

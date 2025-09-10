@@ -423,7 +423,7 @@ async def translate_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         
         # Log translation details for debugging
-        logger.info(f"Translating {len(text)} chars in mode '{mode}' -> '{direction}'")
+        logger.info(f"Translating {len(text)} chars with {len(text.split(chr(10)+chr(10)))} paragraphs in mode '{mode}' -> '{direction}'")
         
         # Use enhanced thread pool executor for better performance
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:

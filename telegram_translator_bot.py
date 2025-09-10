@@ -404,17 +404,24 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         message_id = update.message.message_id
         chat_id = update.effective_chat.id
+        user_id = update.message.from_user.id
+        username = update.message.from_user.username or update.message.from_user.first_name or "Unknown"
+        
+        logger.info(f"Processing text message {message_id} in chat {chat_id} from user {user_id} ({username})")
+        logger.info(f"Message text: {text[:100]}...")
         
         # Store message for translation
         cache_key = f"{chat_id}_{message_id}"
         message_cache[cache_key] = {
             'original_text': text,
             'translated_text': None,
-            'user_id': update.message.from_user.id,
-            'username': update.message.from_user.username or update.message.from_user.first_name,
+            'user_id': user_id,
+            'username': username,
             'direction': None,
-            'state': 'original'  # 'original' or 'translated'
+            'state': 'original'
         }
+        
+        logger.info(f"Cached message with key: {cache_key}")
         
         # Determine translation direction
         mode = chat_modes.get(chat_id, MODE_AUTO)
@@ -425,19 +432,31 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         message_cache[cache_key]['direction'] = direction
         
+        logger.info(f"Translation direction: {direction}")
+        
+        # Get language info for logging
+        source, target, flag_emoji, description = get_language_info(direction)
+        logger.info(f"Will translate from {source} to {target} ({description})")
+        
         # Create translate button
         keyboard = create_translate_button(message_id, direction)
         
         # Add translate button as reply to original message
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="👆 Click to translate",
-            reply_to_message_id=message_id,
-            reply_markup=keyboard
-        )
+        try:
+            bot_message = await context.bot.send_message(
+                chat_id=chat_id,
+                text="👆 Click to translate",
+                reply_to_message_id=message_id,
+                reply_markup=keyboard
+            )
+            
+            logger.info(f"Successfully added translate button for message {message_id}")
+            
+        except Exception as send_error:
+            logger.error(f"Failed to send translate button: {send_error}")
         
     except Exception as e:
-        logger.error(f"Error handling text message: {e}")
+        logger.error(f"Error handling text message: {e}", exc_info=True)
 
 async def handle_translate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle translate button clicks"""

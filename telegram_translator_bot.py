@@ -61,7 +61,7 @@ UA_CYRILLIC_RE = re.compile(r"[А-Яа-яІіЇїЄєҐґ]")
 # Improved sentence boundary detection
 SENTENCE_END_RE = re.compile(r'(?<=[.!?])\s+(?=[A-ZА-ЯІЇЄҐ])')
 # Additional patterns for better sentence detection
-SENTENCE_BOUNDARIES = re.compile(r'(?<=[.!?])\s+|(?<=\.\.\.)\s+|(?<=[.!?]")\s+|(?<=[.!?]\')\s+|(?<=[.!?]')\s+')
+SENTENCE_BOUNDARIES = re.compile(r'(?<=[.!?])\s+|(?<=\.\.\.)\s+|(?<=[.!?]")\s+|(?<=[.!?]\')\s+|(?<=[.!?]\u2019)\s+')
 
 # Flask app
 app = Flask(__name__)

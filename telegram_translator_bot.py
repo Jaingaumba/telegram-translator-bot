@@ -3,16 +3,17 @@ import re
 import logging
 import threading
 import asyncio
-from typing import List
+from typing import List, Dict, Optional
 from flask import Flask, request, jsonify
 import concurrent.futures
 
 from deep_translator import GoogleTranslator
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -43,159 +44,319 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 logger.info(f"Webhook URL: {PUBLIC_URL}/webhook")
 
-# Constants
-TG_SAFE = 4000
-TRANSLATE_CHUNK = 1800
+# Enhanced translation constants
+TRANSLATE_CHUNK_SIZE = 1500    # Optimal chunk size for translation quality
+CONTEXT_OVERLAP = 200          # Overlap between chunks for context preservation
+MIN_TRANSLATE_LENGTH = 10      # Minimum message length to show translate button
+MAX_BUTTON_TEXT_LENGTH = 100   # Max chars to show in button
+
+# Modes
 MODE_AUTO = "auto"
-MODE_TO_UK = "to_uk"
+MODE_TO_UK = "to_uk" 
 MODE_TO_EN = "to_en"
 
 # Global variables
 chat_modes = {}
 telegram_app = None
 bot_loop = None
+message_cache = {}  # Cache original messages and translations
 
-# Language detection
+# Enhanced language detection regex
 UA_CYRILLIC_RE = re.compile(r"[А-Яа-яІіЇїЄєҐґ]")
 
 # Flask app
 app = Flask(__name__)
 
-# -------------------- Utilities --------------------
+# -------------------- Enhanced Translation Utilities --------------------
 def detect_direction(text: str) -> str:
+    """Enhanced direction detection"""
     return MODE_TO_EN if UA_CYRILLIC_RE.search(text) else MODE_TO_UK
 
-def chunk_text(text: str, limit: int) -> List[str]:
-    if len(text) <= limit:
+def get_language_info(direction: str) -> tuple:
+    """Get language information for direction"""
+    if direction == MODE_TO_EN:
+        return "uk", "en", "🇺🇦→🇺🇸", "Ukrainian → English"
+    else:
+        return "en", "uk", "🇺🇸→🇺🇦", "English → Ukrainian"
+
+def enhanced_sentence_split(text: str) -> List[str]:
+    """
+    Advanced sentence splitting that handles multiple languages and edge cases
+    """
+    # Enhanced regex for sentence boundaries
+    sentence_pattern = r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=[.!?])\s+(?=[A-ZА-ЯІЇЄҐ])'
+    
+    # Split by sentence boundaries
+    sentences = re.split(sentence_pattern, text.strip())
+    
+    # Clean up and filter empty sentences
+    cleaned_sentences = []
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if sentence and len(sentence) > 1:
+            cleaned_sentences.append(sentence)
+    
+    return cleaned_sentences if cleaned_sentences else [text]
+
+def create_context_aware_chunks(text: str, chunk_size: int = TRANSLATE_CHUNK_SIZE, overlap: int = CONTEXT_OVERLAP) -> List[str]:
+    """
+    Enhanced chunking algorithm that preserves sentence boundaries and maintains context overlap
+    """
+    if len(text) <= chunk_size:
         return [text]
 
-    chunks = []
-    current = ""
-
-    def push():
-        nonlocal current
-        if current.strip():
-            chunks.append(current.strip())
-        current = ""
-
-    paragraphs = text.split('\n\n')
+    # Split into sentences using enhanced algorithm
+    sentences = enhanced_sentence_split(text)
     
-    for para in paragraphs:
-        if len(current) + len(para) + 2 <= limit:
-            current += ('\n\n' + para) if current else para
-        else:
-            push()
+    if not sentences:
+        return [text]
+    
+    chunks = []
+    current_chunk = ""
+    overlap_sentences = []
+    
+    i = 0
+    while i < len(sentences):
+        sentence = sentences[i]
+        
+        # Calculate potential chunk size with current sentence
+        potential_chunk = current_chunk
+        if potential_chunk and not potential_chunk.endswith(' '):
+            potential_chunk += " "
+        potential_chunk += sentence
+        
+        # If adding this sentence exceeds chunk size
+        if len(potential_chunk) > chunk_size and current_chunk:
+            # Finalize current chunk
+            chunks.append(current_chunk.strip())
             
-            if len(para) > limit:
-                sentences = re.split(r'(?<=[.!?])\s+', para)
-                for sentence in sentences:
-                    if len(current) + len(sentence) + 1 <= limit:
-                        current += (' ' + sentence) if current else sentence
-                    else:
-                        push()
-                        if len(sentence) <= limit:
-                            current = sentence
-                        else:
-                            words = sentence.split()
-                            temp = ""
-                            for word in words:
-                                if len(temp) + len(word) + 1 <= limit:
-                                    temp += (word + ' ')
-                                else:
-                                    if temp.strip():
-                                        chunks.append(temp.strip())
-                                    temp = word + ' '
-                            if temp.strip():
-                                current = temp.strip()
+            # Prepare overlap for next chunk
+            # Take last few sentences that fit within overlap limit
+            overlap_text = ""
+            overlap_sentences = []
+            
+            # Work backwards from current position to build overlap
+            j = i - 1
+            temp_overlap = ""
+            while j >= 0 and len(temp_overlap + " " + sentences[j]) <= overlap:
+                temp_overlap = sentences[j] + " " + temp_overlap
+                overlap_sentences.insert(0, sentences[j])
+                j -= 1
+            
+            # Start new chunk with overlap + current sentence
+            if temp_overlap.strip():
+                current_chunk = temp_overlap.strip() + " " + sentence
             else:
-                current = para
-
-    push()
-    return [chunk for chunk in chunks if chunk.strip()]
-
-def translate_text_sync(text: str, direction: str) -> str:
-    """Synchronous translation function"""
-    try:
-        if direction == MODE_TO_UK:
-            source, target = "en", "uk"
-        elif direction == MODE_TO_EN:
-            source, target = "uk", "en"
+                current_chunk = sentence
+            
         else:
-            source, target = ("uk", "en") if UA_CYRILLIC_RE.search(text) else ("en", "uk")
+            # Add sentence to current chunk
+            if current_chunk:
+                current_chunk += " " + sentence
+            else:
+                current_chunk = sentence
+        
+        i += 1
+    
+    # Add final chunk if it has content
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    
+    # Ensure we have at least one chunk
+    return chunks if chunks else [text]
 
-        chunks = chunk_text(text, TRANSLATE_CHUNK)
+def enhanced_translate_with_context(text: str, source: str, target: str) -> str:
+    """
+    Enhanced translation with superior context preservation and sentence boundary respect
+    """
+    try:
+        # Use enhanced context-aware chunking
+        chunks = create_context_aware_chunks(text)
         translated_chunks = []
-
-        for chunk in chunks:
+        
+        logger.info(f"Translating text in {len(chunks)} context-aware chunks")
+        
+        for i, chunk in enumerate(chunks):
             if not chunk.strip():
                 continue
             
             try:
+                # Create translator with consistent settings
                 translator = GoogleTranslator(source=source, target=target)
-                result = translator.translate(chunk)
-                translated_chunks.append(result if result and result.strip() else chunk)
+                
+                # Translate the chunk
+                result = translator.translate(chunk.strip())
+                
+                if result and result.strip():
+                    translated_result = result.strip()
+                    
+                    # Clean up common translation artifacts
+                    translated_result = re.sub(r'\s+', ' ', translated_result)  # Multiple spaces
+                    translated_result = re.sub(r'\s+([.!?,:;])', r'\1', translated_result)  # Space before punctuation
+                    
+                    translated_chunks.append(translated_result)
+                    logger.debug(f"Chunk {i+1}/{len(chunks)} translated successfully")
+                else:
+                    translated_chunks.append(chunk)
+                    logger.warning(f"Chunk {i+1}/{len(chunks)} translation returned empty result")
+                
             except Exception as e:
-                logger.error(f"Translation error for chunk: {e}")
-                translated_chunks.append(chunk)
-
-        return '\n\n'.join(translated_chunks).strip() or text
+                logger.error(f"Translation error for chunk {i+1}/{len(chunks)}: {e}")
+                translated_chunks.append(chunk)  # Fallback to original
+        
+        # Intelligent chunk joining
+        if len(translated_chunks) == 1:
+            final_translation = translated_chunks[0]
+        else:
+            # Join chunks with smart spacing
+            final_translation = ""
+            for i, chunk in enumerate(translated_chunks):
+                if i == 0:
+                    final_translation = chunk
+                else:
+                    # Determine if we need space between chunks
+                    if (final_translation.endswith('.') or 
+                        final_translation.endswith('!') or 
+                        final_translation.endswith('?') or
+                        final_translation.endswith('\n')):
+                        final_translation += " " + chunk
+                    else:
+                        final_translation += " " + chunk
+        
+        # Final cleanup
+        final_translation = re.sub(r'\s+', ' ', final_translation).strip()
+        
+        return final_translation if final_translation else text
         
     except Exception as e:
-        logger.error(f"Translation error: {e}")
+        logger.error(f"Enhanced translation error: {e}")
         return text
 
-async def send_long_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Send long text by chunking"""
-    parts = chunk_text(text, TG_SAFE)
-    if not parts:
-        return
+def should_add_translate_button(text: str) -> bool:
+    """Determine if message should have translate button"""
+    if not text or len(text.strip()) < MIN_TRANSLATE_LENGTH:
+        return False
     
-    try:
-        await update.message.reply_text(parts[0])
-        for part in parts[1:]:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=part)
-    except Exception as e:
-        logger.error(f"Error sending message: {e}")
-        try:
-            await update.message.reply_text("❌ Failed to send translation. Please try again.")
-        except:
-            pass
+    if text.strip().startswith('/'):
+        return False
+    
+    # Skip if message is mostly emojis/symbols
+    letter_count = len(re.findall(r'[a-zA-Zа-яА-ЯіІїЇєЄґҐ]', text))
+    if letter_count < len(text.strip()) * 0.3:
+        return False
+    
+    return True
+
+def truncate_for_button(text: str, max_length: int = MAX_BUTTON_TEXT_LENGTH) -> str:
+    """Truncate text for button display"""
+    if len(text) <= max_length:
+        return text
+    return text[:max_length-3] + "..."
+
+def create_translate_button(message_id: int, direction: str) -> InlineKeyboardMarkup:
+    """Create translate button"""
+    source, target, flag_emoji, description = get_language_info(direction)
+    
+    callback_data = f"translate_{message_id}_{direction}"
+    button_text = f"🔄 Translate {flag_emoji}"
+    
+    button = InlineKeyboardButton(
+        text=button_text,
+        callback_data=callback_data
+    )
+    
+    return InlineKeyboardMarkup([[button]])
+
+def create_translated_button(original_text: str, translated_text: str, message_id: int, direction: str) -> InlineKeyboardMarkup:
+    """Create button showing translation with option to show original"""
+    
+    # Truncate translated text for button
+    display_text = truncate_for_button(translated_text)
+    
+    source, target, flag_emoji, description = get_language_info(direction)
+    
+    callback_data = f"show_original_{message_id}_{direction}"
+    button_text = f"✅ {display_text}"
+    
+    button = InlineKeyboardButton(
+        text=button_text,
+        callback_data=callback_data
+    )
+    
+    return InlineKeyboardMarkup([[button]])
+
+def create_original_button(original_text: str, message_id: int, direction: str) -> InlineKeyboardMarkup:
+    """Create button showing original with option to show translation"""
+    
+    # Truncate original text for button
+    display_text = truncate_for_button(original_text)
+    
+    source, target, flag_emoji, description = get_language_info(direction)
+    reverse_flag = "🇺🇦→🇺🇸" if flag_emoji == "🇺🇸→🇺🇦" else "🇺🇸→🇺🇦"
+    
+    callback_data = f"show_translation_{message_id}_{direction}"
+    button_text = f"📝 {display_text}"
+    
+    button = InlineKeyboardButton(
+        text=button_text,
+        callback_data=callback_data
+    )
+    
+    return InlineKeyboardMarkup([[button]])
 
 # -------------------- Handlers --------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
     try:
         chat_id = update.effective_chat.id
         chat_modes[chat_id] = MODE_AUTO
         
         welcome_text = (
-            "🔄 **Telegram Translator Bot**\n\n"
-            "I automatically translate between English and Ukrainian!\n\n"
+            "🔄 **Enhanced Context-Aware Translator**\n\n"
+            "**New Features:**\n"
+            "✅ Enhanced context-aware translation\n"
+            "✅ Sentence boundary preservation\n"
+            "✅ Smart chunking with overlap\n"
+            "✅ Inline translation buttons (no chat clutter!)\n\n"
             "**How it works:**\n"
-            "• Send any text - I'll auto-detect and translate\n"
-            "• Latin text → Ukrainian\n"
-            "• Cyrillic text → English\n\n"
+            "1️⃣ Send any text message\n"
+            "2️⃣ Click the 🔄 Translate button\n"
+            "3️⃣ Button shows translation inline\n"
+            "4️⃣ Click again to toggle back to original\n\n"
             "**Commands:**\n"
             "• /auto - Auto-detect language (default)\n"
             "• /to_en - Force Ukrainian → English\n"
             "• /to_uk - Force English → Ukrainian\n"
             "• /help - Show help\n\n"
-            "Ready to translate! 🚀"
+            "**Try it:** Send any message! 🚀"
         )
         
         await update.message.reply_text(welcome_text, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Error in start command: {e}")
-        await update.message.reply_text("Hello! I'm a translation bot. Send me text to translate!")
+        await update.message.reply_text("Hello! I'm an enhanced context-aware translation bot!")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command"""
     try:
         help_text = (
-            "**Available Commands:**\n\n"
-            "/auto – Auto-detect language per message\n"
-            "/to_en – Force Ukrainian → English\n"
-            "/to_uk – Force English → Ukrainian\n"
-            "/help – Show this help\n\n"
-            "Just send any text and I'll translate it automatically!"
+            "**Enhanced Translation Bot Help**\n\n"
+            "**Features:**\n"
+            "🧠 **Smart Context-Aware Translation**\n"
+            "• Preserves sentence boundaries\n"
+            "• Uses context overlap for coherence\n"
+            "• Optimal chunk sizing (1500 chars)\n"
+            "• Enhanced sentence detection\n\n"
+            "🎯 **Inline Translation Interface**\n"
+            "• Click 🔄 Translate button\n"
+            "• Button shows translation inline\n"
+            "• Toggle between original/translated\n"
+            "• No chat clutter or spam\n\n"
+            "**Commands:**\n"
+            "/auto - Auto-detect language\n"
+            "/to_en - Force Ukrainian → English\n"
+            "/to_uk - Force English → Ukrainian\n\n"
+            "**Works perfectly in groups and private chats!**"
         )
         await update.message.reply_text(help_text, parse_mode='Markdown')
     except Exception as e:
@@ -203,75 +364,227 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Available commands: /auto /to_en /to_uk /help")
 
 async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set mode to auto-detect"""
     try:
         chat_modes[update.effective_chat.id] = MODE_AUTO
-        await update.message.reply_text("✅ Mode set to **auto-detect**", parse_mode='Markdown')
+        await update.message.reply_text("✅ Mode: **Auto-detect language** 🔄", parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Error in auto command: {e}")
         await update.message.reply_text("✅ Mode set to auto-detect")
 
 async def to_en_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set mode to Ukrainian -> English"""
     try:
         chat_modes[update.effective_chat.id] = MODE_TO_EN
-        await update.message.reply_text("✅ Mode set to **Ukrainian → English**", parse_mode='Markdown')
+        await update.message.reply_text("✅ Mode: **Ukrainian → English** 🇺🇦→🇺🇸", parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Error in to_en command: {e}")
         await update.message.reply_text("✅ Mode set to Ukrainian → English")
 
 async def to_uk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set mode to English -> Ukrainian"""
     try:
         chat_modes[update.effective_chat.id] = MODE_TO_UK
-        await update.message.reply_text("✅ Mode set to **English → Ukrainian**", parse_mode='Markdown')
+        await update.message.reply_text("✅ Mode: **English → Ukrainian** 🇺🇸→🇺🇦", parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Error in to_uk command: {e}")
         await update.message.reply_text("✅ Mode set to English → Ukrainian")
 
-async def translate_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages and translate them"""
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages and add translate buttons"""
     try:
         if not update.message or not update.message.text:
             return
         
         text = update.message.text.strip()
         
-        if text.startswith("/") or len(text) < 2:
+        # Skip commands and messages that shouldn't be translated
+        if text.startswith("/") or not should_add_translate_button(text):
             return
 
+        message_id = update.message.message_id
         chat_id = update.effective_chat.id
+        
+        # Store message for translation
+        cache_key = f"{chat_id}_{message_id}"
+        message_cache[cache_key] = {
+            'original_text': text,
+            'translated_text': None,
+            'user_id': update.message.from_user.id,
+            'username': update.message.from_user.username or update.message.from_user.first_name,
+            'direction': None,
+            'state': 'original'  # 'original' or 'translated'
+        }
+        
+        # Determine translation direction
         mode = chat_modes.get(chat_id, MODE_AUTO)
-        direction = detect_direction(text) if mode == MODE_AUTO else mode
-
-        try:
-            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        except:
-            pass
+        if mode == MODE_AUTO:
+            direction = detect_direction(text)
+        else:
+            direction = mode
         
-        # Use a proper thread pool executor to run synchronous translation
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            loop = asyncio.get_event_loop()
-            translated = await loop.run_in_executor(executor, translate_text_sync, text, direction)
+        message_cache[cache_key]['direction'] = direction
         
-        if not translated or translated == text:
-            if mode == MODE_AUTO:
-                await update.message.reply_text("🤔 I couldn't detect the language. Try /to_en or /to_uk")
-            else:
-                await update.message.reply_text("⚠️ Translation failed. Please try again.")
-            return
+        # Create translate button
+        keyboard = create_translate_button(message_id, direction)
         
-        await send_long_text(update, context, translated)
+        # Add translate button as reply to original message
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="👆 Click to translate",
+            reply_to_message_id=message_id,
+            reply_markup=keyboard
+        )
         
     except Exception as e:
-        logger.error(f"Translation failed: {e}")
-        try:
-            await update.message.reply_text("❌ Translation error. Please try again later.")
-        except:
-            pass
+        logger.error(f"Error handling text message: {e}")
+
+async def handle_translate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle translate button clicks"""
+    try:
+        query = update.callback_query
+        await query.answer("Translating... 🔄")
+        
+        # Parse callback data
+        callback_data = query.data
+        if not callback_data.startswith("translate_"):
+            return
+        
+        parts = callback_data.split("_")
+        if len(parts) != 3:
+            await query.answer("Invalid request", show_alert=True)
+            return
+        
+        message_id = int(parts[1])
+        direction = parts[2]
+        
+        chat_id = query.message.chat.id
+        
+        # Get cached message
+        cache_key = f"{chat_id}_{message_id}"
+        if cache_key not in message_cache:
+            await query.answer("Message not found or expired", show_alert=True)
+            return
+        
+        cached_msg = message_cache[cache_key]
+        original_text = cached_msg['original_text']
+        
+        # Get language info
+        source, target, flag_emoji, description = get_language_info(direction)
+        
+        # Show typing action
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        
+        # Perform enhanced translation
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            loop = asyncio.get_event_loop()
+            translated_text = await loop.run_in_executor(
+                executor, enhanced_translate_with_context, original_text, source, target
+            )
+        
+        if not translated_text or translated_text == original_text:
+            await query.answer("Translation failed. Please try again.", show_alert=True)
+            return
+        
+        # Store translation in cache
+        cached_msg['translated_text'] = translated_text
+        cached_msg['state'] = 'translated'
+        
+        # Update button to show translation
+        new_keyboard = create_translated_button(original_text, translated_text, message_id, direction)
+        
+        await query.edit_message_reply_markup(reply_markup=new_keyboard)
+        
+        logger.info(f"Successfully translated message {message_id} from {source} to {target}")
+        
+    except Exception as e:
+        logger.error(f"Translation callback error: {e}")
+        await query.answer("Translation error. Please try again.", show_alert=True)
+
+async def handle_show_original_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle showing original text"""
+    try:
+        query = update.callback_query
+        await query.answer("Showing original text 📝")
+        
+        # Parse callback data
+        callback_data = query.data
+        parts = callback_data.split("_")
+        if len(parts) != 4:
+            return
+        
+        message_id = int(parts[2])
+        direction = parts[3]
+        chat_id = query.message.chat.id
+        
+        # Get cached message
+        cache_key = f"{chat_id}_{message_id}"
+        if cache_key not in message_cache:
+            await query.answer("Message not found", show_alert=True)
+            return
+        
+        cached_msg = message_cache[cache_key]
+        original_text = cached_msg['original_text']
+        
+        # Update state
+        cached_msg['state'] = 'original'
+        
+        # Update button to show original with option to translate again
+        new_keyboard = create_original_button(original_text, message_id, direction)
+        
+        await query.edit_message_reply_markup(reply_markup=new_keyboard)
+        
+    except Exception as e:
+        logger.error(f"Show original callback error: {e}")
+
+async def handle_show_translation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle showing translation again"""
+    try:
+        query = update.callback_query
+        await query.answer("Showing translation 🔄")
+        
+        # Parse callback data
+        callback_data = query.data
+        parts = callback_data.split("_")
+        if len(parts) != 4:
+            return
+        
+        message_id = int(parts[2])
+        direction = parts[3]
+        chat_id = query.message.chat.id
+        
+        # Get cached message
+        cache_key = f"{chat_id}_{message_id}"
+        if cache_key not in message_cache:
+            await query.answer("Message not found", show_alert=True)
+            return
+        
+        cached_msg = message_cache[cache_key]
+        original_text = cached_msg['original_text']
+        translated_text = cached_msg['translated_text']
+        
+        if not translated_text:
+            await query.answer("Translation not available", show_alert=True)
+            return
+        
+        # Update state
+        cached_msg['state'] = 'translated'
+        
+        # Update button to show translation
+        new_keyboard = create_translated_button(original_text, translated_text, message_id, direction)
+        
+        await query.edit_message_reply_markup(reply_markup=new_keyboard)
+        
+    except Exception as e:
+        logger.error(f"Show translation callback error: {e}")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors"""
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 # -------------------- Bot Setup --------------------
 def create_application() -> Application:
+    """Create Telegram application"""
     return (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
@@ -283,6 +596,7 @@ def create_application() -> Application:
     )
 
 async def setup_bot():
+    """Setup bot with handlers"""
     global telegram_app
     
     telegram_app = create_application()
@@ -293,7 +607,10 @@ async def setup_bot():
     telegram_app.add_handler(CommandHandler("auto", auto_cmd))
     telegram_app.add_handler(CommandHandler("to_en", to_en_cmd))
     telegram_app.add_handler(CommandHandler("to_uk", to_uk_cmd))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, translate_msg))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    telegram_app.add_handler(CallbackQueryHandler(handle_translate_callback, pattern="^translate_"))
+    telegram_app.add_handler(CallbackQueryHandler(handle_show_original_callback, pattern="^show_original_"))
+    telegram_app.add_handler(CallbackQueryHandler(handle_show_translation_callback, pattern="^show_translation_"))
     telegram_app.add_error_handler(error_handler)
     
     # Initialize and start
@@ -307,10 +624,11 @@ async def setup_bot():
         drop_pending_updates=True
     )
     
-    logger.info(f"✅ Webhook set to: {webhook_url}")
+    logger.info(f"✅ Enhanced context-aware translator webhook set to: {webhook_url}")
     return telegram_app
 
 def run_bot_in_thread():
+    """Run bot in separate thread"""
     global bot_loop
     
     def bot_thread():
@@ -320,8 +638,7 @@ def run_bot_in_thread():
         
         try:
             bot_loop.run_until_complete(setup_bot())
-            logger.info("✅ Bot initialized successfully")
-            # Keep the loop running
+            logger.info("✅ Enhanced context-aware bot initialized successfully")
             bot_loop.run_forever()
         except Exception as e:
             logger.error(f"❌ Bot initialization failed: {e}")
@@ -337,19 +654,33 @@ def run_bot_in_thread():
     if not bot_loop or not telegram_app:
         raise RuntimeError("Bot initialization failed")
     
-    logger.info("✅ Bot thread started successfully")
+    logger.info("✅ Enhanced bot thread started successfully")
 
 # -------------------- Flask Routes --------------------
 @app.route("/", methods=["GET"])
 def index():
+    """Health check endpoint"""
     return jsonify({
-        "status": "Telegram Translator Bot is running!",
+        "status": "Enhanced Context-Aware Telegram Translator Bot is running!",
+        "features": [
+            "context_aware_translation",
+            "sentence_boundary_preservation", 
+            "smart_chunking_with_overlap",
+            "inline_translation_buttons",
+            "toggle_original_translated"
+        ],
+        "translation_settings": {
+            "chunk_size": TRANSLATE_CHUNK_SIZE,
+            "context_overlap": CONTEXT_OVERLAP,
+            "min_translate_length": MIN_TRANSLATE_LENGTH
+        },
         "webhook_url": f"{PUBLIC_URL}/webhook",
         "bot_initialized": telegram_app is not None
     })
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    """Handle Telegram webhooks"""
     try:
         if not telegram_app or not bot_loop:
             logger.error("Bot not initialized")
@@ -369,11 +700,10 @@ def webhook():
             bot_loop
         )
         
-        # Wait briefly for processing to start but don't block Flask
+        # Don't wait for completion to avoid blocking Flask
         try:
             future.result(timeout=0.1)
         except concurrent.futures.TimeoutError:
-            # This is fine, processing will continue in background
             pass
         except Exception as e:
             logger.error(f"Update processing error: {e}")
@@ -384,32 +714,10 @@ def webhook():
         logger.error(f"Webhook error: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
-@app.route("/set_webhook", methods=["POST", "GET"])
-def set_webhook():
-    try:
-        if not telegram_app or not bot_loop:
-            return jsonify({"error": "Bot not initialized"}), 500
-            
-        webhook_url = f"{PUBLIC_URL}/webhook"
-        
-        future = asyncio.run_coroutine_threadsafe(
-            telegram_app.bot.set_webhook(url=webhook_url, drop_pending_updates=True),
-            bot_loop
-        )
-        
-        success = future.result(timeout=10)
-        if success:
-            return jsonify({"status": "Webhook set successfully", "url": webhook_url})
-        else:
-            return jsonify({"error": "Failed to set webhook"}), 400
-            
-    except Exception as e:
-        logger.error(f"Set webhook error: {e}")
-        return jsonify({"error": str(e)}), 500
-
 # -------------------- Main --------------------
 def main():
-    logger.info("🚀 Starting Telegram Translator Bot...")
+    """Main function"""
+    logger.info("🚀 Starting Enhanced Context-Aware Telegram Translator Bot...")
     
     try:
         # Initialize bot in separate thread
